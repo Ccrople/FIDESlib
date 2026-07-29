@@ -231,14 +231,28 @@ index e2223e8a..060f9b6e 100644
              lDec = L0 - compositeDegree * depthBT;
          }
 diff --git a/src/binfhe/include/binfhe-base-scheme.h b/src/binfhe/include/binfhe-base-scheme.h
+index 0e117be4..f30e8404 100644
 --- a/src/binfhe/include/binfhe-base-scheme.h
 +++ b/src/binfhe/include/binfhe-base-scheme.h
-@@ -235 +235 @@ protected:
+@@ -232,7 +232,7 @@ private:
+                                 ConstLWECiphertext& ct, const Func f, NativeInteger fmod) const;
+ 
+ protected:
 -    std::shared_ptr<LWEEncryptionScheme> LWEscheme{std::make_shared<LWEEncryptionScheme>()};
 +    std::shared_ptr<LWEEncryptionScheme> LWEscheme = std::make_shared<LWEEncryptionScheme>();
+     std::shared_ptr<RingGSWAccumulator> ACCscheme{nullptr};
+ 
+     /**
 diff --git a/src/binfhe/include/binfhecontext.h b/src/binfhe/include/binfhecontext.h
+index 4300807b..8d510bc0 100644
 --- a/src/binfhe/include/binfhecontext.h
 +++ b/src/binfhe/include/binfhecontext.h
-@@ -462 +462 @@ private:
+@@ -459,7 +459,7 @@ private:
+     std::shared_ptr<BinFHECryptoParams> m_params{nullptr};
+ 
+     // Shared pointer to the underlying additive LWE scheme
 -    std::shared_ptr<LWEEncryptionScheme> m_LWEscheme{std::make_shared<LWEEncryptionScheme>()};
 +    std::shared_ptr<LWEEncryptionScheme> m_LWEscheme = std::make_shared<LWEEncryptionScheme>();
+ 
+     // Shared pointer to the underlying RingGSW/RLWE scheme
+     std::shared_ptr<BinFHEScheme> m_binfhescheme{nullptr};
