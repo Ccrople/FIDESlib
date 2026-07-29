@@ -5,8 +5,7 @@
 #include "CKKS/Context.cuh"
 #include "CKKS/KeySwitchingKey.cuh"
 #include "CKKS/RNSPoly.cuh"
-#include <source_location>
-#if defined(__clang__)
+#if defined(__clang__) || defined(__CUDACC__)
 #include <experimental/source_location>
 using sc = std::experimental::source_location;
 // constexpr int PREFIX_SIZE = 0;

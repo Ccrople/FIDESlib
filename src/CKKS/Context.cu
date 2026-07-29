@@ -4,13 +4,11 @@
 #include "CKKS/BootstrapPrecomputation.cuh"
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/Context.cuh"
-#include <source_location>
-
 #include "../parallel_for.hpp"
 #include "CKKS/KeySwitchingKey.cuh"
 #include "CKKS/RNSPoly.cuh"
 
-#if defined(__clang__)
+#if defined(__clang__) || defined(__CUDACC__)
 #include <experimental/source_location>
 using sc = std::experimental::source_location;
 #else

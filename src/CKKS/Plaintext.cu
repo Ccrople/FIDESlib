@@ -5,7 +5,7 @@
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/Context.cuh"
 #include "CKKS/Plaintext.cuh"
-#if defined(__clang__)
+#if defined(__clang__) || defined(__CUDACC__)
 #include <experimental/source_location>
 using sc = std::experimental::source_location;
 // constexpr int PREFIX_SIZE = 0;

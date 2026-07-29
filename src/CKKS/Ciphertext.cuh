@@ -8,7 +8,6 @@
 #include "RNSPoly.cuh"
 #include "forwardDefs.cuh"
 #include "openfhe-interface/RawCiphertext.cuh"
-#include <source_location>
 
 namespace FIDESlib::CKKS {
 

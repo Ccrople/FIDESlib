@@ -8,7 +8,7 @@
 #include "CKKS/Plaintext.cuh"
 #include "CudaUtils.cuh"
 
-#if defined(__clang__)
+#if defined(__clang__) || defined(__CUDACC__)
 #include <experimental/source_location>
 using sc = std::experimental::source_location;
 #else

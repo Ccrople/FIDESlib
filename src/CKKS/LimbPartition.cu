@@ -15,7 +15,7 @@
 #include "Rotation.cuh"
 #include "VectorGPU.cuh"
 
-#if defined(__clang__)
+#if defined(__clang__) || defined(__CUDACC__)
 #include <experimental/source_location>
 using sc = std::experimental::source_location;
 // constexpr int PREFIX_SIZE = 0;
