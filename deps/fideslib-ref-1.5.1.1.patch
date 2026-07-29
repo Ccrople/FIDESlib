@@ -230,3 +230,15 @@ index e2223e8a..060f9b6e 100644
                                 precom->m_paramsDec.lvlb;
              lDec = L0 - compositeDegree * depthBT;
          }
+diff --git a/src/binfhe/include/binfhe-base-scheme.h b/src/binfhe/include/binfhe-base-scheme.h
+--- a/src/binfhe/include/binfhe-base-scheme.h
++++ b/src/binfhe/include/binfhe-base-scheme.h
+@@ -235 +235 @@ protected:
+-    std::shared_ptr<LWEEncryptionScheme> LWEscheme{std::make_shared<LWEEncryptionScheme>()};
++    std::shared_ptr<LWEEncryptionScheme> LWEscheme = std::make_shared<LWEEncryptionScheme>();
+diff --git a/src/binfhe/include/binfhecontext.h b/src/binfhe/include/binfhecontext.h
+--- a/src/binfhe/include/binfhecontext.h
++++ b/src/binfhe/include/binfhecontext.h
+@@ -462 +462 @@ private:
+-    std::shared_ptr<LWEEncryptionScheme> m_LWEscheme{std::make_shared<LWEEncryptionScheme>()};
++    std::shared_ptr<LWEEncryptionScheme> m_LWEscheme = std::make_shared<LWEEncryptionScheme>();
