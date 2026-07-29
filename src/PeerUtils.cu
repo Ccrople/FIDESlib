@@ -53,8 +53,14 @@ static void launch(cudaFunction_t kernel, dim3 grid, dim3 block, void** args, ui
 	std::cout << "[P2P] Dependencies before launch: " << deps_before.size() << std::endl;
 
 	CudaCheckErrorModNoSync;
+#if CUDART_VERSION >= 12040
 	CUlaunchAttribute attr[] = { { .id = CU_LAUNCH_ATTRIBUTE_MEM_SYNC_DOMAIN, .value = { .memSyncDomain = CU_LAUNCH_MEM_SYNC_DOMAIN_REMOTE } },
 		{ .id = CU_LAUNCH_ATTRIBUTE_DEVICE_UPDATABLE_KERNEL_NODE, .value = { .deviceUpdatableKernelNode = { .deviceUpdatable = 1, .devNode = nullptr } } } };
+#else
+	CUlaunchAttribute attr[] = {
+		{ .id = CU_LAUNCH_ATTRIBUTE_MEM_SYNC_DOMAIN, .value = { .memSyncDomain = CU_LAUNCH_MEM_SYNC_DOMAIN_REMOTE } }
+	};
+#endif
 
 	// void* extra[] = { CU_LAUNCH_PARAM_BUFFER_POINTER, args, CU_LAUNCH_PARAM_BUFFER_SIZE, &args_size, CU_LAUNCH_PARAM_END };
 	/* Cooperative Group Array (CGA)
