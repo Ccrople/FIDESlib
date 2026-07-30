@@ -214,9 +214,12 @@ TEST(BatchMatrixTest, BatchCPMMMatchesReference) {
 	// finished by the time a test body runs.
 	FIDESlib::CKKS::Parameters fideslibParams{ .logN = logN, .L = L, .dnum = dnum, .primes = p64, .Sprimes = sp64 };
 
+	std::cerr << "[stage] raw params" << std::endl;
 	FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc);
-	FIDESlib::CKKS::Context cc_			= FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), std::vector<int>{ 0 });
-	FIDESlib::CKKS::ContextData& gpu	= *cc_;
+	std::cerr << "[stage] gpu context" << std::endl;
+	FIDESlib::CKKS::Context cc_		 = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), std::vector<int>{ 0 });
+	FIDESlib::CKKS::ContextData& gpu = *cc_;
+	std::cerr << "[stage] gpu context ok, N=" << gpu.N << " L=" << gpu.L << " meta0=" << gpu.meta[0].size() << std::endl;
 
 	const int N = gpu.N;
 	const int d = 64;
@@ -244,6 +247,7 @@ TEST(BatchMatrixTest, BatchCPMMMatchesReference) {
 
 	const int level	   = inputs[0].c0.getLevel();
 	const int numLimbs = level + 1;
+	std::cerr << "[stage] encrypted, level=" << level << std::endl;
 
 	// Reference copy of the inputs in the coefficient domain.
 	std::vector<std::vector<std::vector<uint64_t>>> refC0(inner), refC1(inner);
@@ -264,9 +268,12 @@ TEST(BatchMatrixTest, BatchCPMMMatchesReference) {
 	for (auto& v : U)
 		v = small(rng);
 
+	std::cerr << "[stage] reference stored" << std::endl;
+
 	FIDESlib::CKKS::BatchMatrixPlaintext ptU(cc_, layout, inner, colsOut, level);
 	ptU.NoiseFactor = inputs[0].NoiseFactor;
 	ptU.Load(U);
+	std::cerr << "[stage] plaintext matrix loaded" << std::endl;
 
 	std::vector<FIDESlib::CKKS::Ciphertext*> inPtrs;
 	for (auto& c : inputs)
@@ -274,6 +281,7 @@ TEST(BatchMatrixTest, BatchCPMMMatchesReference) {
 
 	std::vector<FIDESlib::CKKS::Ciphertext> outputs;
 	FIDESlib::CKKS::BatchCPMM(outputs, inPtrs, ptU, /*rescale=*/false);
+	std::cerr << "[stage] BatchCPMM done" << std::endl;
 	ASSERT_EQ(outputs.size(), static_cast<size_t>(colsOut));
 
 	std::vector<std::vector<std::vector<uint64_t>>> gotC0(colsOut), gotC1(colsOut);
