@@ -177,21 +177,45 @@ TEST(BatchMatrixEncryption, CoefficientLayoutRoundTrip) {
 // Batch CPMM, Algorithm 1
 // ---------------------------------------------------------------------------
 
-class BatchMatrixTest : public GeneralParametrizedTest {};
-
 /**
  * Runs batch CPMM on real ciphertexts and compares against a matrix product over
  * R_{q,k} evaluated on the host from the same limb data. The rescale of step 2
  * is skipped so the raw product is what gets compared.
+ *
+ * The contexts are built inside the test body rather than through the shared
+ * parameterised fixture: the tparams globals in ParametrizedTest.cuh copy the
+ * gparams globals during static initialisation, which is order-dependent across
+ * translation units and can hand the fixture a partially zeroed parameter set.
  */
-TEST_P(BatchMatrixTest, BatchCPMMMatchesReference) {
+TEST(BatchMatrixTest, BatchCPMMMatchesReference) {
+	constexpr int logN = 13;
+	constexpr int L	   = 5;
+	constexpr int dnum = 2;
+
+	lbcrypto::CCParams<lbcrypto::CryptoContextCKKSRNS> parameters;
+	parameters.SetMultiplicativeDepth(L);
+	parameters.SetFirstModSize(60);
+	parameters.SetScalingModSize(36);
+	parameters.SetBatchSize(8);
+	parameters.SetSecurityLevel(lbcrypto::HEStd_NotSet);
+	parameters.SetRingDim(1 << logN);
+	parameters.SetNumLargeDigits(dnum);
+	parameters.SetScalingTechnique(lbcrypto::ScalingTechnique::FIXEDMANUAL);
+	parameters.SetSecretKeyDist(lbcrypto::UNIFORM_TERNARY);
+	parameters.SetPREMode(lbcrypto::INDCPA);
+
+	lbcrypto::CryptoContext<lbcrypto::DCRTPoly> cc = GenCryptoContext(parameters);
 	cc->Enable(lbcrypto::PKE);
 	cc->Enable(lbcrypto::KEYSWITCH);
 	cc->Enable(lbcrypto::LEVELEDSHE);
+	lbcrypto::KeyPair<lbcrypto::DCRTPoly> keys = cc->KeyGen();
+
+	// Safe to read the shared prime tables here: static initialisation has
+	// finished by the time a test body runs.
+	FIDESlib::CKKS::Parameters fideslibParams{ .logN = logN, .L = L, .dnum = dnum, .primes = p64, .Sprimes = sp64 };
 
 	FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc);
-	FIDESlib::CKKS::Context& cc_		= GPUcc;
-	cc_									= FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), devices);
+	FIDESlib::CKKS::Context cc_			= FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), std::vector<int>{ 0 });
 	FIDESlib::CKKS::ContextData& gpu	= *cc_;
 
 	const int N = gpu.N;
@@ -291,7 +315,5 @@ TEST_P(BatchMatrixTest, BatchCPMMMatchesReference) {
 		}
 	}
 }
-
-INSTANTIATE_TEST_SUITE_P(BatchMatrixTests, BatchMatrixTest, testing::Values(tparams64_13_fix));
 
 } // namespace FIDESlib::Testing
