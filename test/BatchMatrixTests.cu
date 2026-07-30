@@ -9,6 +9,7 @@
 #include "CKKS/BatchMatrix.cuh"
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/Context.cuh"
+#include "CKKS/KeySwitchingKey.cuh"
 #include "CKKS/RNSPoly.cuh"
 #include "CKKS/openfhe-interface/RawCiphertext.cuh"
 #include "ParametrizedTest.cuh"
@@ -327,6 +328,148 @@ TEST(BatchMatrixTest, BatchCPMMMatchesReference) {
 						ASSERT_EQ(actual, expected) << "component " << comp << " limb " << l << " row " << i << " col " << jj << " coeff " << s;
 					}
 				}
+			}
+		}
+	}
+}
+
+/**
+ * Runs batch CCMM and compares against a matrix product over R_{q,k} computed
+ * on the host.
+ *
+ * Both operands are given a zero c1 component. That makes every key switch in
+ * the pipeline exact — key switching a zero polynomial yields exactly zero, as
+ * does relinearising (0,0) — so CMT, TWEAK, the automorphisms, the four GEMMs
+ * and the final combination can all be checked for exact equality rather than
+ * against a noise tolerance. With c1 = 0 the underlying matrix is simply the c0
+ * matrix, so the expected result is the plain product of the two c0 matrices.
+ */
+TEST(BatchMatrixTest, BatchCCMMMatchesReference) {
+	constexpr int logN = 16;
+	constexpr int L	   = 23;
+	constexpr int dnum = 2;
+
+	lbcrypto::CCParams<lbcrypto::CryptoContextCKKSRNS> parameters;
+	parameters.SetMultiplicativeDepth(L);
+	parameters.SetFirstModSize(60);
+	parameters.SetScalingModSize(59);
+	parameters.SetBatchSize(8);
+	parameters.SetSecurityLevel(lbcrypto::HEStd_NotSet);
+	parameters.SetRingDim(1 << logN);
+	parameters.SetNumLargeDigits(dnum);
+	parameters.SetScalingTechnique(lbcrypto::ScalingTechnique::FIXEDMANUAL);
+	parameters.SetSecretKeyDist(lbcrypto::UNIFORM_TERNARY);
+	parameters.SetPREMode(lbcrypto::INDCPA);
+
+	lbcrypto::CryptoContext<lbcrypto::DCRTPoly> cc = GenCryptoContext(parameters);
+	cc->Enable(lbcrypto::PKE);
+	cc->Enable(lbcrypto::KEYSWITCH);
+	cc->Enable(lbcrypto::LEVELEDSHE);
+	lbcrypto::KeyPair<lbcrypto::DCRTPoly> keys = cc->KeyGen();
+	cc->EvalMultKeyGen(keys.secretKey);
+
+	FIDESlib::CKKS::Parameters fideslibParams{ .logN = logN, .L = L, .dnum = dnum, .primes = p64, .Sprimes = sp64 };
+
+	FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc);
+	FIDESlib::CKKS::Context cc_			= FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), std::vector<int>{ 0 });
+	FIDESlib::CKKS::ContextData& gpu	= *cc_;
+
+	const int d = 64;
+	const FIDESlib::CKKS::BatchMatrixLayout layout(gpu.N, d);
+	const int k = layout.k;
+
+	// CMT needs the automorphisms X -> X^(2kt+1); CCMM additionally needs the
+	// relinearisation key.
+	FIDESlib::CKKS::GenAndAddRotationKeys(cc, keys, cc_, FIDESlib::CKKS::GetBatchCMTRotationIndices(layout));
+	{
+		FIDESlib::CKKS::KeySwitchingKey kskEval(cc_);
+		FIDESlib::CKKS::RawKeySwitchKey rawKskEval = FIDESlib::CKKS::GetEvalKeySwitchKey(keys);
+		kskEval.Initialize(rawKskEval);
+		gpu.AddEvalKey(std::move(kskEval));
+	}
+
+	// A modest level keeps the host reference and the device tensors affordable.
+	constexpr int testLevel = 3;
+	const int numLimbs		= testLevel + 1;
+
+	std::mt19937 rng(4242);
+	std::uniform_real_distribution<double> dist(-1.0, 1.0);
+	std::vector<uint64_t> zeros(gpu.prime.size(), 0);
+
+	auto makeOperand = [&](std::vector<FIDESlib::CKKS::Ciphertext>& dst) {
+		dst.reserve(d);
+		for (int j = 0; j < d; ++j) {
+			std::vector<double> vals(8);
+			for (auto& v : vals)
+				v = dist(rng);
+			lbcrypto::Plaintext pt			  = cc->MakeCKKSPackedPlaintext(vals);
+			auto ct							  = cc->Encrypt(keys.publicKey, pt);
+			FIDESlib::CKKS::RawCipherText raw = FIDESlib::CKKS::GetRawCipherText(cc, ct);
+			dst.emplace_back(cc_, raw);
+			dst.back().dropToLevel(testLevel);
+			dst.back().c1.multScalar(zeros); // trivial encryption: c1 = 0
+		}
+	};
+
+	std::vector<FIDESlib::CKKS::Ciphertext> opA, opB;
+	makeOperand(opA);
+	makeOperand(opB);
+
+	// Snapshot the c0 matrices, which are the underlying matrices here.
+	auto snapshot = [&](std::vector<FIDESlib::CKKS::Ciphertext>& src, std::vector<std::vector<std::vector<uint64_t>>>& dstC0) {
+		dstC0.resize(d);
+		for (int j = 0; j < d; ++j) {
+			FIDESlib::CKKS::Ciphertext tmp(cc_);
+			tmp.copy(src[j]);
+			tmp.c0.INTT<FIDESlib::ALGO_SHOUP>(1, true);
+			cudaDeviceSynchronize();
+			tmp.c0.store(dstC0[j]);
+		}
+	};
+	std::vector<std::vector<std::vector<uint64_t>>> refA, refB;
+	snapshot(opA, refA);
+	snapshot(opB, refB);
+
+	std::vector<FIDESlib::CKKS::Ciphertext*> pa, pb;
+	for (auto& c : opA)
+		pa.push_back(&c);
+	for (auto& c : opB)
+		pb.push_back(&c);
+
+	std::vector<FIDESlib::CKKS::Ciphertext> outputs;
+	FIDESlib::CKKS::BatchCCMM(outputs, pa, pb, layout, /*rescale=*/false);
+	ASSERT_EQ(outputs.size(), static_cast<size_t>(d));
+
+	std::vector<std::vector<std::vector<uint64_t>>> gotC0(d), gotC1(d);
+	for (int j = 0; j < d; ++j) {
+		outputs[j].c0.INTT<FIDESlib::ALGO_SHOUP>(1, true);
+		outputs[j].c1.INTT<FIDESlib::ALGO_SHOUP>(1, true);
+		cudaDeviceSynchronize();
+		outputs[j].c0.store(gotC0[j]);
+		outputs[j].c1.store(gotC1[j]);
+	}
+
+	// The naive host reference costs d * k^2 per entry, so check a spread of
+	// entries rather than all d^2 of them.
+	std::vector<std::pair<int, int>> checks = { { 0, 0 }, { 0, 1 }, { 1, 0 }, { 3, 5 }, { d / 2, d / 2 }, { d - 1, d - 1 }, { d - 1, 0 }, { 0, d - 1 } };
+
+	for (int l = 0; l < numLimbs; ++l) {
+		const int primeid = gpu.meta[0][l].id;
+		const uint64_t p  = gpu.prime[primeid].p;
+
+		for (auto [i, jj] : checks) {
+			std::vector<uint64_t> acc(k, 0);
+			for (int t = 0; t < d; ++t) {
+				std::vector<uint64_t> lhs(k), rhs(k);
+				for (int s = 0; s < k; ++s) {
+					lhs[s] = refA[t][l][i + static_cast<size_t>(d) * s];
+					rhs[s] = refB[jj][l][t + static_cast<size_t>(d) * s];
+				}
+				NegacyclicMulAcc(acc, lhs, rhs, p);
+			}
+			for (int s = 0; s < k; ++s) {
+				ASSERT_EQ(gotC0[jj][l][i + static_cast<size_t>(d) * s], acc[s]) << "c0 limb " << l << " row " << i << " col " << jj << " coeff " << s;
+				ASSERT_EQ(gotC1[jj][l][i + static_cast<size_t>(d) * s], 0u) << "c1 should stay zero: limb " << l << " row " << i << " col " << jj;
 			}
 		}
 	}

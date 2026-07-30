@@ -16,6 +16,7 @@
 
 #include <cmath>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -42,6 +43,24 @@ uint64_t modpow(uint64_t base, uint64_t exp, uint64_t p) {
 /** Valid for prime p. */
 uint64_t modinv(uint64_t a, uint64_t p) {
 	return modpow(a, p - 2, p);
+}
+
+/** Inverse modulo an arbitrary modulus; 2N is a power of two, so Fermat does not apply. */
+uint64_t modinvGeneric(uint64_t a, uint64_t m) {
+	int64_t t = 0, newt = 1;
+	int64_t r = static_cast<int64_t>(m), newr = static_cast<int64_t>(a % m);
+	while (newr != 0) {
+		const int64_t q = r / newr;
+		int64_t tmp		= t - q * newt;
+		t = newt, newt = tmp;
+		tmp = r - q * newr;
+		r = newr, newr = tmp;
+	}
+	if (r != 1)
+		throw std::runtime_error("value is not invertible modulo the cyclotomic order");
+	if (t < 0)
+		t += static_cast<int64_t>(m);
+	return static_cast<uint64_t>(t);
 }
 
 /**
@@ -431,6 +450,103 @@ __global__ void bm_gemm(uint64_t* __restrict__ C,
 	}
 }
 
+/**
+ * The PPMM of Algorithm 4, where both operands come from ciphertexts.
+ *
+ * Same structure as bm_gemm, but the right operand has no precomputed Shoup
+ * factors (it changes every call), so products go through Barrett. Its two
+ * strides let the caller consume it transposed without moving any data, which
+ * is what the (.)^T in steps 1, 3 and 4 of Algorithm 4 asks for.
+ */
+__global__ void bm_gemm_barrett(uint64_t* __restrict__ C,
+  const uint64_t* __restrict__ A,
+  const uint64_t* __restrict__ B,
+  const int* __restrict__ primeids,
+  const int rowsA,
+  const int inner,
+  const int colsB,
+  const int k,
+  const int bStrideT,
+  const int bStrideJ) {
+	const int s = blockIdx.x * blockDim.x + threadIdx.x;
+	if (s >= k)
+		return;
+
+	const int tilesJ = (colsB + BM_TJ - 1) / BM_TJ;
+	const int i0	 = (blockIdx.y / tilesJ) * BM_TI;
+	const int j0	 = (blockIdx.y % tilesJ) * BM_TJ;
+	const int limb	 = blockIdx.z;
+	const int pid	 = primeids[limb];
+	const uint64_t p = C_.primes[pid];
+
+	const uint64_t* __restrict__ Al = A + static_cast<size_t>(limb) * rowsA * inner * k;
+	const uint64_t* __restrict__ Bl = B + static_cast<size_t>(limb) * inner * colsB * k;
+	uint64_t* __restrict__ Cl		= C + static_cast<size_t>(limb) * rowsA * colsB * k;
+
+	uint64_t acc[BM_TI][BM_TJ];
+#pragma unroll
+	for (int a = 0; a < BM_TI; ++a)
+#pragma unroll
+		for (int b = 0; b < BM_TJ; ++b)
+			acc[a][b] = 0;
+
+	for (int t = 0; t < inner; ++t) {
+		uint64_t av[BM_TI];
+#pragma unroll
+		for (int a = 0; a < BM_TI; ++a) {
+			const int i = i0 + a;
+			av[a]		= (i < rowsA) ? Al[(static_cast<size_t>(i) * inner + t) * k + s] : 0;
+		}
+		uint64_t bv[BM_TJ];
+#pragma unroll
+		for (int b = 0; b < BM_TJ; ++b) {
+			const int j = j0 + b;
+			bv[b]		= (j < colsB) ? Bl[(static_cast<size_t>(t) * bStrideT + static_cast<size_t>(j) * bStrideJ) * k + s] : 0;
+		}
+#pragma unroll
+		for (int a = 0; a < BM_TI; ++a)
+#pragma unroll
+			for (int b = 0; b < BM_TJ; ++b) {
+				const uint64_t prod = modmult<ALGO_BARRETT>(av[a], bv[b], pid);
+				uint64_t x			= acc[a][b] + prod;
+				acc[a][b]			= (x >= p) ? x - p : x;
+			}
+	}
+
+#pragma unroll
+	for (int a = 0; a < BM_TI; ++a) {
+		const int i = i0 + a;
+		if (i >= rowsA)
+			continue;
+#pragma unroll
+		for (int b = 0; b < BM_TJ; ++b) {
+			const int j = j0 + b;
+			if (j >= colsB)
+				continue;
+			Cl[(static_cast<size_t>(i) * colsB + j) * k + s] = acc[a][b];
+		}
+	}
+}
+
+/**
+ * Transpose a matrix held as d column ciphertexts, in the coefficient domain.
+ *
+ * Entry (i,j) of the matrix lives in coefficient i + d*t of column j, so the
+ * transpose is a pure permutation of coefficients across ciphertexts and needs
+ * no subring transform.
+ */
+__global__ void bm_transpose_columns(uint64_t* const* __restrict__ dst, const uint64_t* const* __restrict__ src, const int d, const int k) {
+	const int t = blockIdx.x * blockDim.x + threadIdx.x;
+	if (t >= k)
+		return;
+	const int j	   = blockIdx.y;
+	const int limb = blockIdx.z;
+
+	uint64_t* __restrict__ o = dst[static_cast<size_t>(limb) * d + j];
+	for (int i = 0; i < d; ++i)
+		o[i + static_cast<size_t>(d) * t] = src[static_cast<size_t>(limb) * d + i][j + static_cast<size_t>(d) * t];
+}
+
 // ---------------------------------------------------------------------------
 // Limb plumbing
 // ---------------------------------------------------------------------------
@@ -804,6 +920,398 @@ void BatchCPMM(std::vector<Ciphertext>& out, const std::vector<Ciphertext*>& in,
 	for (int j = 0; j < colsOut; ++j) {
 		out[j].NoiseFactor = in[0]->NoiseFactor * U.NoiseFactor;
 		out[j].NoiseLevel  = in[0]->NoiseLevel + 1;
+		if (rescale)
+			out[j].rescale();
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Batch CMT and batch CCMM
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/** Owns a device array of per-(limb, column) limb pointers. */
+struct DevicePointers {
+	uint64_t** dev = nullptr;
+	explicit DevicePointers(const std::vector<uint64_t*>& host) {
+		cudaMalloc(&dev, host.size() * sizeof(uint64_t*));
+		cudaMemcpy(dev, host.data(), host.size() * sizeof(uint64_t*), cudaMemcpyHostToDevice);
+	}
+	~DevicePointers() {
+		if (dev)
+			cudaFree(dev);
+	}
+	DevicePointers(const DevicePointers&)			 = delete;
+	DevicePointers& operator=(const DevicePointers&) = delete;
+};
+
+std::vector<uint64_t*> componentPointers(const std::vector<Ciphertext*>& cts, bool useC1, int numLimbs) {
+	const int cols = static_cast<int>(cts.size());
+	std::vector<uint64_t*> h(static_cast<size_t>(numLimbs) * cols);
+	for (int l = 0; l < numLimbs; ++l)
+		for (int j = 0; j < cols; ++j)
+			h[static_cast<size_t>(l) * cols + j] = limbData(useC1 ? cts[j]->c1 : cts[j]->c0, l);
+	return h;
+}
+
+/** Coefficient-domain ciphertext component -> subring tensor in the R_k NTT domain. */
+void gatherToTensor(const std::vector<Ciphertext*>& cts, bool useC1, uint64_t* tensor, const SubringTables& tables, int d, int k, int numLimbs) {
+	const int cols = static_cast<int>(cts.size());
+	DevicePointers ptrs(componentPointers(cts, useC1, numLimbs));
+	const dim3 block(BM_TILE, 8);
+	const dim3 grid((k + BM_TILE - 1) / BM_TILE, (d + BM_TILE - 1) / BM_TILE, static_cast<unsigned>(numLimbs) * cols);
+	bm_gather<<<grid, block>>>(tensor, const_cast<const uint64_t* const*>(ptrs.dev), d, cols, k);
+	launchNTTk(tensor, tables, k, d * cols, numLimbs, false);
+}
+
+/** Inverse of gatherToTensor; leaves the ciphertext component in the coefficient domain. */
+void scatterFromTensor(uint64_t* tensor, const std::vector<Ciphertext*>& cts, bool useC1, const SubringTables& tables, int d, int k, int numLimbs) {
+	const int cols = static_cast<int>(cts.size());
+	launchNTTk(tensor, tables, k, d * cols, numLimbs, true);
+	DevicePointers ptrs(componentPointers(cts, useC1, numLimbs));
+	const dim3 block(BM_TILE, 8);
+	const dim3 grid((k + BM_TILE - 1) / BM_TILE, (d + BM_TILE - 1) / BM_TILE, static_cast<unsigned>(numLimbs) * cols);
+	bm_scatter<<<grid, block>>>(ptrs.dev, tensor, d, cols, k);
+}
+
+std::vector<Ciphertext*> rawPointers(std::vector<Ciphertext>& v) {
+	std::vector<Ciphertext*> r;
+	r.reserve(v.size());
+	for (auto& c : v)
+		r.push_back(&c);
+	return r;
+}
+
+void intttAll(const std::vector<Ciphertext*>& cts) {
+	for (Ciphertext* c : cts) {
+		c->c0.INTT<ALGO_SHOUP>(1, false);
+		c->c1.INTT<ALGO_SHOUP>(1, false);
+	}
+	cudaDeviceSynchronize();
+}
+
+void nttAll(const std::vector<Ciphertext*>& cts) {
+	for (Ciphertext* c : cts) {
+		c->c0.NTT<ALGO_SHOUP>(1, false);
+		c->c1.NTT<ALGO_SHOUP>(1, false);
+	}
+	cudaDeviceSynchronize();
+}
+
+/** Algorithm 2, on ciphertexts that the caller owns. */
+void tweakRecursive(std::vector<std::unique_ptr<Ciphertext>>& ct, int k, int sgn, int N, Context& cc_) {
+	const int d = static_cast<int>(ct.size());
+	if (d <= 1)
+		return;
+
+	std::vector<std::unique_ptr<Ciphertext>> even, odd;
+	even.reserve(d / 2);
+	odd.reserve(d / 2);
+	for (int j = 0; j < d / 2; ++j) {
+		even.push_back(std::move(ct[2 * j]));
+		odd.push_back(std::move(ct[2 * j + 1]));
+	}
+
+	tweakRecursive(even, 2 * k, sgn, N, cc_);
+	tweakRecursive(odd, 2 * k, sgn, N, cc_);
+
+	const long long twoN = 2ll * N;
+	for (int j = 0; j < d / 2; ++j) {
+		const long long e	  = 2ll * k * j * sgn;
+		const int power		  = static_cast<int>(((e % twoN) + twoN) % twoN);
+		if (power != 0)
+			odd[j]->multMonomial(power);
+
+		auto lo = std::make_unique<Ciphertext>(cc_);
+		auto hi = std::make_unique<Ciphertext>(cc_);
+		lo->add(*even[j], *odd[j]);
+		hi->sub(*even[j], *odd[j]);
+		ct[j]			= std::move(lo);
+		ct[j + d / 2]	= std::move(hi);
+	}
+}
+
+} // namespace
+
+std::vector<int> GetBatchCMTRotationIndices(const BatchMatrixLayout& layout) {
+	const int N			= layout.N;
+	const int k			= layout.k;
+	const int d			= layout.d;
+	const uint64_t mod	= 2ull * static_cast<uint64_t>(N);
+	const int half		= N / 2;
+
+	// rotation index r corresponds to the Galois element 5^r mod 2N
+	std::map<uint64_t, int> galoisToIndex;
+	uint64_t g = 1;
+	for (int r = 0; r < half; ++r) {
+		galoisToIndex.emplace(g, r);
+		g = (g * 5) % mod;
+	}
+
+	std::vector<int> res;
+	for (int t = 0; t < d; ++t) {
+		const uint64_t h = (2ull * k * t + 1) % mod;
+		auto it			 = galoisToIndex.find(h);
+		if (it == galoisToIndex.end())
+			throw std::runtime_error("automorphism X -> X^(2kt+1) is not a slot rotation for this layout");
+		if (it->second != 0)
+			res.push_back(it->second);
+	}
+	return res;
+}
+
+void BatchTweak(std::vector<Ciphertext>& ct, const BatchMatrixLayout& layout, int sgn) {
+	if (static_cast<int>(ct.size()) != layout.d)
+		throw std::invalid_argument("BatchTweak expects exactly d ciphertexts");
+	Context& cc_ = ct[0].cc_;
+	SetCurrentContext(cc_);
+
+	std::vector<std::unique_ptr<Ciphertext>> work;
+	work.reserve(layout.d);
+	for (int i = 0; i < layout.d; ++i) {
+		work.push_back(std::make_unique<Ciphertext>(cc_));
+		work.back()->copy(ct[i]);
+	}
+
+	tweakRecursive(work, layout.k, sgn, layout.N, cc_);
+
+	for (int i = 0; i < layout.d; ++i)
+		ct[i].copy(*work[i]);
+}
+
+void BatchCMT(std::vector<Ciphertext>& ct, const BatchMatrixLayout& layout) {
+	CudaNvtxRange range("FIDESlib::CKKS::BatchCMT");
+
+	const int d = layout.d;
+	const int k = layout.k;
+	const int N = layout.N;
+	if (static_cast<int>(ct.size()) != d)
+		throw std::invalid_argument("BatchCMT expects exactly d ciphertexts");
+
+	Context& cc_	= ct[0].cc_;
+	ContextData& cc = ct[0].cc;
+	SetCurrentContext(cc_);
+
+	// Step 1: ct_i <- X^i * ct_i
+	for (int i = 1; i < d; ++i)
+		ct[i].multMonomial(i);
+
+	// Step 2
+	BatchTweak(ct, layout, +1);
+
+	// Step 3: scale by d^-1, then permute and apply the automorphisms. The map
+	// t -> t* is a bijection, so scaling every ciphertext once is equivalent to
+	// the per-t scaling written in the algorithm.
+	{
+		std::vector<uint64_t> dinv(cc.prime.size(), 0);
+		for (size_t i = 0; i < cc.prime.size(); ++i) {
+			const uint64_t p = cc.prime[i].p;
+			if (p > 1)
+				dinv[i] = modinv(static_cast<uint64_t>(d) % p, p);
+		}
+		for (int i = 0; i < d; ++i) {
+			ct[i].c0.multScalar(dinv);
+			ct[i].c1.multScalar(dinv);
+		}
+	}
+
+	const uint64_t mod = 2ull * static_cast<uint64_t>(N);
+	std::map<uint64_t, int> galoisToIndex;
+	{
+		uint64_t g = 1;
+		for (int r = 0; r < N / 2; ++r) {
+			galoisToIndex.emplace(g, r);
+			g = (g * 5) % mod;
+		}
+	}
+
+	std::vector<Ciphertext> aux;
+	aux.reserve(d);
+	for (int t = 0; t < d; ++t) {
+		const uint64_t h	= (2ull * k * t + 1) % mod;
+		const uint64_t hinv = modinvGeneric(h, mod);
+		const int tstar		= static_cast<int>((hinv - 1) / (2ull * k));
+		if (tstar < 0 || tstar >= d)
+			throw std::runtime_error("inverse Galois element fell outside the CMT index range");
+
+		aux.emplace_back(cc_);
+		aux.back().copy(ct[tstar]);
+		auto it = galoisToIndex.find(h);
+		if (it == galoisToIndex.end())
+			throw std::runtime_error("automorphism X -> X^(2kt+1) is not a slot rotation for this layout");
+		if (it->second != 0) {
+			// rotate() folds the index through normalyzeIndex, which is the
+			// identity only at full slot count.
+			const int savedSlots = aux.back().slots;
+			aux.back().slots	 = N / 2;
+			aux.back().rotate(it->second);
+			aux.back().slots = savedSlots;
+		}
+	}
+	for (int t = 0; t < d; ++t)
+		ct[t].copy(aux[t]);
+
+	// Step 4
+	BatchTweak(ct, layout, -1);
+
+	// Step 5: ct'_i <- X^-i * ct'_i
+	for (int i = 1; i < d; ++i)
+		ct[i].multMonomial(2 * N - i);
+}
+
+void BatchCCMM(std::vector<Ciphertext>& out,
+  const std::vector<Ciphertext*>& a,
+  const std::vector<Ciphertext*>& b,
+  const BatchMatrixLayout& layout,
+  bool rescale) {
+	CudaNvtxRange range("FIDESlib::CKKS::BatchCCMM");
+
+	const int d = layout.d;
+	const int k = layout.k;
+	if (static_cast<int>(a.size()) != d || static_cast<int>(b.size()) != d)
+		throw std::invalid_argument("BatchCCMM expects exactly d ciphertexts per operand");
+
+	Context& cc_	= a[0]->cc_;
+	ContextData& cc = a[0]->cc;
+	SetCurrentContext(cc_);
+	requireSingleDevice(cc);
+	if (cc.N != layout.N)
+		throw std::invalid_argument("layout ring degree does not match the context");
+
+	const int level	   = a[0]->c0.getLevel();
+	const int numLimbs = level + 1;
+	const int device   = cc.GPUid[0];
+	cudaSetDevice(device);
+
+	std::vector<int> primeids(numLimbs);
+	std::vector<uint64_t> primes(numLimbs);
+	for (int l = 0; l < numLimbs; ++l) {
+		primeids[l] = limbPrimeId(a[0]->c0, l);
+		primes[l]	= cc.prime[primeids[l]].p;
+	}
+	const SubringTables& tables = getSubringTables(k, primeids, primes, device);
+
+	// Step 1: right operand becomes a row-wise matrix encryption. The transpose
+	// is applied by the GEMM strides below rather than by moving data.
+	std::vector<Ciphertext> bcmt;
+	bcmt.reserve(d);
+	for (int j = 0; j < d; ++j) {
+		bcmt.emplace_back(cc_);
+		bcmt.back().copy(*b[j]);
+	}
+	BatchCMT(bcmt, layout);
+
+	const size_t elems = static_cast<size_t>(numLimbs) * d * d * k;
+	uint64_t *B = nullptr, *A = nullptr, *Bo = nullptr, *Ao = nullptr;
+	uint64_t *C00 = nullptr, *C01 = nullptr, *C10 = nullptr, *C11 = nullptr;
+	for (uint64_t** p : { &B, &A, &Bo, &Ao, &C00, &C01, &C10, &C11 })
+		cudaMalloc(p, elems * sizeof(uint64_t));
+	CudaCheckErrorMod;
+
+	std::vector<Ciphertext*> bcmtPtrs = rawPointers(bcmt);
+
+	intttAll(a);
+	intttAll(bcmtPtrs);
+	gatherToTensor(a, false, B, tables, d, k, numLimbs);
+	gatherToTensor(a, true, A, tables, d, k, numLimbs);
+	gatherToTensor(bcmtPtrs, false, Bo, tables, d, k, numLimbs);
+	gatherToTensor(bcmtPtrs, true, Ao, tables, d, k, numLimbs);
+	nttAll(a);
+
+	// Step 2. The right operands are consumed transposed: entry (t,j) of Bo^T
+	// is Bo[j][t], so the strides are swapped.
+	{
+		const int threads = 32;
+		const dim3 grid((k + threads - 1) / threads, static_cast<unsigned>(((d + BM_TI - 1) / BM_TI) * ((d + BM_TJ - 1) / BM_TJ)), static_cast<unsigned>(numLimbs));
+		bm_gemm_barrett<<<grid, threads>>>(C00, B, Bo, tables.primeids, d, d, d, k, 1, d);
+		bm_gemm_barrett<<<grid, threads>>>(C01, B, Ao, tables.primeids, d, d, d, k, 1, d);
+		bm_gemm_barrett<<<grid, threads>>>(C10, A, Bo, tables.primeids, d, d, d, k, 1, d);
+		bm_gemm_barrett<<<grid, threads>>>(C11, A, Ao, tables.primeids, d, d, d, k, 1, d);
+		cudaDeviceSynchronize();
+		CudaCheckErrorMod;
+	}
+
+	// Steps 3 and 4: fold each half back into ciphertexts, transpose it, and
+	// convert it from row-wise to column-wise with a CMT.
+	auto toCiphertexts = [&](uint64_t* c0src, uint64_t* c1src, std::vector<Ciphertext>& dst) {
+		dst.clear();
+		dst.reserve(d);
+		for (int j = 0; j < d; ++j) {
+			dst.emplace_back(cc_);
+			dst.back().copy(*a[0]);
+		}
+		std::vector<Ciphertext*> p = rawPointers(dst);
+		intttAll(p);
+		scatterFromTensor(c0src, p, false, tables, d, k, numLimbs);
+		scatterFromTensor(c1src, p, true, tables, d, k, numLimbs);
+		cudaDeviceSynchronize();
+		nttAll(p);
+		BatchCMT(dst, layout);
+
+		// Transpose the resulting matrices, a pure coefficient permutation.
+		std::vector<Ciphertext> tr;
+		tr.reserve(d);
+		for (int j = 0; j < d; ++j) {
+			tr.emplace_back(cc_);
+			tr.back().copy(dst[j]);
+		}
+		std::vector<Ciphertext*> tp = rawPointers(tr);
+		std::vector<Ciphertext*> sp = rawPointers(dst);
+		intttAll(sp);
+		intttAll(tp);
+		{
+			const dim3 grid((k + 127) / 128, static_cast<unsigned>(d), static_cast<unsigned>(numLimbs));
+			for (int comp = 0; comp < 2; ++comp) {
+				DevicePointers s(componentPointers(sp, comp == 1, numLimbs));
+				DevicePointers t(componentPointers(tp, comp == 1, numLimbs));
+				bm_transpose_columns<<<grid, 128>>>(t.dev, const_cast<const uint64_t* const*>(s.dev), d, k);
+				cudaDeviceSynchronize();
+			}
+		}
+		nttAll(tp);
+		for (int j = 0; j < d; ++j)
+			dst[j].copy(tr[j]);
+	};
+
+	std::vector<Ciphertext> D01, D23;
+	toCiphertexts(C00, C01, D01);
+	toCiphertexts(C10, C11, D23);
+
+	for (uint64_t* p : { B, A, Bo, Ao, C00, C01, C10, C11 })
+		cudaFree(p);
+	CudaCheckErrorMod;
+
+	// Step 5: relinearise (0, D3).
+	std::vector<Ciphertext> E;
+	E.reserve(d);
+	{
+		std::vector<uint64_t> zero(cc.prime.size(), 0);
+		const KeySwitchingKey& relin = cc.GetEvalKey(a[0]->keyID);
+		for (int j = 0; j < d; ++j) {
+			E.emplace_back(cc_);
+			E.back().copy(D23[j]);
+			E.back().c0.multScalar(zero); // (0, D3)
+			E.back().keySwitch(relin);
+		}
+	}
+
+	// Step 6: Bres = D0 + E0, Ares = D1 + D2 + E1.
+	out.clear();
+	out.reserve(d);
+	for (int j = 0; j < d; ++j) {
+		out.emplace_back(cc_);
+		out.back().copy(D01[j]);
+		out.back().add(E[j]);
+		out.back().c1.add(D23[j].c0);
+	}
+	cudaDeviceSynchronize();
+	CudaCheckErrorMod;
+
+	// Step 7
+	for (int j = 0; j < d; ++j) {
+		out[j].NoiseFactor = a[0]->NoiseFactor * b[0]->NoiseFactor;
+		out[j].NoiseLevel  = a[0]->NoiseLevel + b[0]->NoiseLevel;
 		if (rescale)
 			out[j].rescale();
 	}
