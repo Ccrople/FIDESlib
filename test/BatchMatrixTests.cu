@@ -216,6 +216,18 @@ TEST(BatchMatrixTest, BatchCPMMMatchesReference) {
 
 	std::cerr << "[stage] raw params" << std::endl;
 	FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc);
+	std::cerr << "[dbg] L=" << raw_param.L << " dnum=" << raw_param.dnum << " K=" << raw_param.K << std::endl;
+	std::cerr << "[dbg] moduli(" << raw_param.moduli.size() << "):";
+	for (auto m : raw_param.moduli)
+		std::cerr << " " << m;
+	std::cerr << std::endl;
+	std::cerr << "[dbg] partitions(" << raw_param.PARTITIONmoduli.size() << "):" << std::endl;
+	for (size_t i = 0; i < raw_param.PARTITIONmoduli.size(); ++i) {
+		std::cerr << "[dbg]   part " << i << ":";
+		for (auto m : raw_param.PARTITIONmoduli[i])
+			std::cerr << " " << m;
+		std::cerr << std::endl;
+	}
 	std::cerr << "[stage] gpu context" << std::endl;
 	FIDESlib::CKKS::Context cc_		 = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), std::vector<int>{ 0 });
 	FIDESlib::CKKS::ContextData& gpu = *cc_;
