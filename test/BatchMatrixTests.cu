@@ -1,0 +1,297 @@
+//
+// Tests for the batch matrix encoding, the matrix encryption layout and batch
+// CPMM of Cheon, Kang and Lee, "Fast Batch Matrix Multiplication in Ciphertexts".
+//
+
+#include <openfhe.h>
+#undef duration
+
+#include "CKKS/BatchMatrix.cuh"
+#include "CKKS/Ciphertext.cuh"
+#include "CKKS/Context.cuh"
+#include "CKKS/RNSPoly.cuh"
+#include "CKKS/openfhe-interface/RawCiphertext.cuh"
+#include "ParametrizedTest.cuh"
+
+#include <gtest/gtest.h>
+#include <random>
+
+namespace FIDESlib::Testing {
+
+namespace {
+
+/** Negacyclic product in Z_p[Y]/(Y^k + 1), accumulated into acc. */
+void NegacyclicMulAcc(std::vector<uint64_t>& acc, const std::vector<uint64_t>& a, const std::vector<uint64_t>& b, uint64_t p) {
+	const int k = static_cast<int>(a.size());
+	for (int i = 0; i < k; ++i) {
+		if (a[i] == 0)
+			continue;
+		for (int j = 0; j < k; ++j) {
+			uint64_t v	= static_cast<uint64_t>((static_cast<__uint128_t>(a[i]) * b[j]) % p);
+			int idx		= i + j;
+			if (idx >= k) {
+				idx -= k;
+				v = (v == 0) ? 0 : p - v;
+			}
+			acc[idx] = (acc[idx] + v) % p;
+		}
+	}
+}
+
+uint64_t ToModular(int64_t v, uint64_t p) {
+	if (v >= 0)
+		return static_cast<uint64_t>(v) % p;
+	const uint64_t m = static_cast<uint64_t>(-v) % p;
+	return m == 0 ? 0 : p - m;
+}
+
+/** Naive negacyclic product over the integers, for the encoding tests. */
+std::vector<int64_t> NegacyclicMulInt(const std::vector<int64_t>& a, const std::vector<int64_t>& b) {
+	const int k = static_cast<int>(a.size());
+	std::vector<int64_t> r(k, 0);
+	for (int i = 0; i < k; ++i)
+		for (int j = 0; j < k; ++j) {
+			const int idx	 = i + j;
+			const int64_t v	 = a[i] * b[j];
+			if (idx >= k)
+				r[idx - k] -= v;
+			else
+				r[idx] += v;
+		}
+	return r;
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// Batch matrix encoding, Definition 1
+// ---------------------------------------------------------------------------
+
+TEST(BatchMatrixEncoding, RoundTrip) {
+	constexpr int k	   = 32;
+	constexpr int rows = 3;
+	constexpr int cols = 2;
+	const double Delta = std::pow(2.0, 30);
+
+	FIDESlib::CKKS::BatchMatrixEncoder enc(k);
+	std::mt19937 rng(12345);
+	std::uniform_real_distribution<double> dist(-1.0, 1.0);
+
+	std::vector<std::vector<std::complex<double>>> batch(enc.slots(), std::vector<std::complex<double>>(rows * cols));
+	for (auto& m : batch)
+		for (auto& v : m)
+			v = std::complex<double>(dist(rng), dist(rng));
+
+	std::vector<int64_t> encoded;
+	enc.Encode(batch, rows, cols, Delta, encoded);
+	ASSERT_EQ(encoded.size(), static_cast<size_t>(rows) * cols * k);
+
+	std::vector<std::vector<std::complex<double>>> decoded;
+	enc.Decode(encoded, rows, cols, Delta, decoded);
+
+	ASSERT_EQ(decoded.size(), batch.size());
+	for (size_t l = 0; l < batch.size(); ++l)
+		for (size_t e = 0; e < batch[l].size(); ++e) {
+			EXPECT_NEAR(decoded[l][e].real(), batch[l][e].real(), 1e-6) << "slot " << l << " entry " << e;
+			EXPECT_NEAR(decoded[l][e].imag(), batch[l][e].imag(), 1e-6) << "slot " << l << " entry " << e;
+		}
+}
+
+/**
+ * The property the whole construction rests on: multiplying two encoded entries
+ * in R_k performs the entrywise product across every matrix in the batch at once.
+ */
+TEST(BatchMatrixEncoding, IsMultiplicative) {
+	constexpr int k	   = 16;
+	constexpr int rows = 2;
+	constexpr int cols = 2;
+	const double Delta = std::pow(2.0, 18);
+
+	FIDESlib::CKKS::BatchMatrixEncoder enc(k);
+	std::mt19937 rng(999);
+	std::uniform_real_distribution<double> dist(-1.0, 1.0);
+
+	const size_t entries = rows * cols;
+	std::vector<std::vector<std::complex<double>>> ma(enc.slots(), std::vector<std::complex<double>>(entries));
+	std::vector<std::vector<std::complex<double>>> mb(enc.slots(), std::vector<std::complex<double>>(entries));
+	for (int l = 0; l < enc.slots(); ++l)
+		for (size_t e = 0; e < entries; ++e) {
+			ma[l][e] = std::complex<double>(dist(rng), dist(rng));
+			mb[l][e] = std::complex<double>(dist(rng), dist(rng));
+		}
+
+	std::vector<int64_t> ea, eb;
+	enc.Encode(ma, rows, cols, Delta, ea);
+	enc.Encode(mb, rows, cols, Delta, eb);
+
+	// Entrywise product in R_k; the result carries Delta^2.
+	std::vector<int64_t> prod(entries * k, 0);
+	for (size_t e = 0; e < entries; ++e) {
+		const std::vector<int64_t> a(ea.begin() + e * k, ea.begin() + (e + 1) * k);
+		const std::vector<int64_t> b(eb.begin() + e * k, eb.begin() + (e + 1) * k);
+		const std::vector<int64_t> c = NegacyclicMulInt(a, b);
+		std::copy(c.begin(), c.end(), prod.begin() + e * k);
+	}
+
+	std::vector<std::vector<std::complex<double>>> decoded;
+	enc.Decode(prod, rows, cols, Delta * Delta, decoded);
+
+	for (int l = 0; l < enc.slots(); ++l)
+		for (size_t e = 0; e < entries; ++e) {
+			const std::complex<double> expected = ma[l][e] * mb[l][e];
+			EXPECT_NEAR(decoded[l][e].real(), expected.real(), 1e-5) << "slot " << l << " entry " << e;
+			EXPECT_NEAR(decoded[l][e].imag(), expected.imag(), 1e-5) << "slot " << l << " entry " << e;
+		}
+}
+
+// ---------------------------------------------------------------------------
+// Matrix encryption layout, Definition 2
+// ---------------------------------------------------------------------------
+
+TEST(BatchMatrixEncryption, CoefficientLayoutRoundTrip) {
+	constexpr int N	   = 256;
+	constexpr int d	   = 8;
+	constexpr int cols = 3;
+	const FIDESlib::CKKS::BatchMatrixLayout layout(N, d);
+	ASSERT_EQ(layout.k, N / d);
+	ASSERT_EQ(layout.batch, N / d / 2);
+
+	std::vector<int64_t> coeffs(static_cast<size_t>(d) * cols * layout.k);
+	std::mt19937 rng(7);
+	std::uniform_int_distribution<int64_t> dist(-1000, 1000);
+	for (auto& v : coeffs)
+		v = dist(rng);
+
+	std::vector<std::vector<int64_t>> columns;
+	FIDESlib::CKKS::BuildMatrixEncryptionCoefficients(coeffs, layout, d, cols, columns);
+	ASSERT_EQ(columns.size(), static_cast<size_t>(cols));
+	for (const auto& c : columns)
+		ASSERT_EQ(c.size(), static_cast<size_t>(N));
+
+	std::vector<int64_t> back;
+	FIDESlib::CKKS::SplitMatrixEncryptionCoefficients(columns, layout, d, cols, back);
+	EXPECT_EQ(back, coeffs);
+}
+
+// ---------------------------------------------------------------------------
+// Batch CPMM, Algorithm 1
+// ---------------------------------------------------------------------------
+
+class BatchMatrixTest : public GeneralParametrizedTest {};
+
+/**
+ * Runs batch CPMM on real ciphertexts and compares against a matrix product over
+ * R_{q,k} evaluated on the host from the same limb data. The rescale of step 2
+ * is skipped so the raw product is what gets compared.
+ */
+TEST_P(BatchMatrixTest, BatchCPMMMatchesReference) {
+	cc->Enable(lbcrypto::PKE);
+	cc->Enable(lbcrypto::KEYSWITCH);
+	cc->Enable(lbcrypto::LEVELEDSHE);
+
+	FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc);
+	FIDESlib::CKKS::Context& cc_		= GPUcc;
+	cc_									= FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), devices);
+	FIDESlib::CKKS::ContextData& gpu	= *cc_;
+
+	const int N = gpu.N;
+	const int d = 64;
+	ASSERT_EQ(N % d, 0);
+	const FIDESlib::CKKS::BatchMatrixLayout layout(N, d);
+	const int k		  = layout.k;
+	const int inner	  = 4;
+	const int colsOut = 4;
+
+	// Any valid ciphertexts will do: the test checks the linear-algebra pipeline,
+	// which acts on the ciphertext polynomials regardless of what they encrypt.
+	std::mt19937 rng(2024);
+	std::uniform_real_distribution<double> dist(-1.0, 1.0);
+	std::vector<FIDESlib::CKKS::Ciphertext> inputs;
+	inputs.reserve(inner);
+	for (int j = 0; j < inner; ++j) {
+		std::vector<double> vals(gpu.N / 2);
+		for (auto& v : vals)
+			v = dist(rng);
+		lbcrypto::Plaintext pt = cc->MakeCKKSPackedPlaintext(vals);
+		auto ct				   = cc->Encrypt(keys.publicKey, pt);
+		FIDESlib::CKKS::RawCipherText raw = FIDESlib::CKKS::GetRawCipherText(cc, ct);
+		inputs.emplace_back(cc_, raw);
+	}
+
+	const int level	   = inputs[0].c0.getLevel();
+	const int numLimbs = level + 1;
+
+	// Reference copy of the inputs in the coefficient domain.
+	std::vector<std::vector<std::vector<uint64_t>>> refC0(inner), refC1(inner);
+	for (int j = 0; j < inner; ++j) {
+		FIDESlib::CKKS::Ciphertext tmp(cc_);
+		tmp.copy(inputs[j]);
+		tmp.c0.INTT<FIDESlib::ALGO_SHOUP>(1, true);
+		tmp.c1.INTT<FIDESlib::ALGO_SHOUP>(1, true);
+		cudaDeviceSynchronize();
+		tmp.c0.store(refC0[j]);
+		tmp.c1.store(refC1[j]);
+	}
+
+	// Plaintext matrix with small entries, taken directly as R_k coefficients so
+	// that this test isolates the GPU pipeline from the encoder.
+	std::uniform_int_distribution<int64_t> small(-4, 4);
+	std::vector<int64_t> U(static_cast<size_t>(inner) * colsOut * k);
+	for (auto& v : U)
+		v = small(rng);
+
+	FIDESlib::CKKS::BatchMatrixPlaintext ptU(cc_, layout, inner, colsOut, level);
+	ptU.NoiseFactor = inputs[0].NoiseFactor;
+	ptU.Load(U);
+
+	std::vector<FIDESlib::CKKS::Ciphertext*> inPtrs;
+	for (auto& c : inputs)
+		inPtrs.push_back(&c);
+
+	std::vector<FIDESlib::CKKS::Ciphertext> outputs;
+	FIDESlib::CKKS::BatchCPMM(outputs, inPtrs, ptU, /*rescale=*/false);
+	ASSERT_EQ(outputs.size(), static_cast<size_t>(colsOut));
+
+	std::vector<std::vector<std::vector<uint64_t>>> gotC0(colsOut), gotC1(colsOut);
+	for (int j = 0; j < colsOut; ++j) {
+		outputs[j].c0.INTT<FIDESlib::ALGO_SHOUP>(1, true);
+		outputs[j].c1.INTT<FIDESlib::ALGO_SHOUP>(1, true);
+		cudaDeviceSynchronize();
+		outputs[j].c0.store(gotC0[j]);
+		outputs[j].c1.store(gotC1[j]);
+	}
+
+	// Host reference: (B * U, A * U) over R_{q,k}, one limb at a time.
+	for (int comp = 0; comp < 2; ++comp) {
+		const auto& ref = (comp == 0) ? refC0 : refC1;
+		const auto& got = (comp == 0) ? gotC0 : gotC1;
+
+		for (int l = 0; l < numLimbs; ++l) {
+			const int primeid = gpu.meta[0][l].id;
+			const uint64_t p  = gpu.prime[primeid].p;
+
+			for (int i = 0; i < d; ++i) {
+				for (int jj = 0; jj < colsOut; ++jj) {
+					std::vector<uint64_t> acc(k, 0);
+					for (int t = 0; t < inner; ++t) {
+						std::vector<uint64_t> lhs(k), rhs(k);
+						for (int s = 0; s < k; ++s) {
+							lhs[s] = ref[t][l][i + static_cast<size_t>(d) * s];
+							rhs[s] = ToModular(U[(static_cast<size_t>(t) * colsOut + jj) * k + s], p);
+						}
+						NegacyclicMulAcc(acc, lhs, rhs, p);
+					}
+					for (int s = 0; s < k; ++s) {
+						const uint64_t expected = acc[s];
+						const uint64_t actual	= got[jj][l][i + static_cast<size_t>(d) * s];
+						ASSERT_EQ(actual, expected) << "component " << comp << " limb " << l << " row " << i << " col " << jj << " coeff " << s;
+					}
+				}
+			}
+		}
+	}
+}
+
+INSTANTIATE_TEST_SUITE_P(BatchMatrixTests, BatchMatrixTest, testing::Values(tparams64_13_fix));
+
+} // namespace FIDESlib::Testing
