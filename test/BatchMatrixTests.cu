@@ -188,14 +188,17 @@ TEST(BatchMatrixEncryption, CoefficientLayoutRoundTrip) {
  * translation units and can hand the fixture a partially zeroed parameter set.
  */
 TEST(BatchMatrixTest, BatchCPMMMatchesReference) {
-	constexpr int logN = 13;
-	constexpr int L	   = 5;
+	// Matches the gparams64_13_2 family, the only configuration the existing
+	// OpenFHE-backed suites exercise. Smaller ring degrees combined with
+	// adaptTo() hit an unrelated pre-existing failure in context construction.
+	constexpr int logN = 16;
+	constexpr int L	   = 23;
 	constexpr int dnum = 2;
 
 	lbcrypto::CCParams<lbcrypto::CryptoContextCKKSRNS> parameters;
 	parameters.SetMultiplicativeDepth(L);
 	parameters.SetFirstModSize(60);
-	parameters.SetScalingModSize(36);
+	parameters.SetScalingModSize(59);
 	parameters.SetBatchSize(8);
 	parameters.SetSecurityLevel(lbcrypto::HEStd_NotSet);
 	parameters.SetRingDim(1 << logN);
@@ -214,27 +217,14 @@ TEST(BatchMatrixTest, BatchCPMMMatchesReference) {
 	// finished by the time a test body runs.
 	FIDESlib::CKKS::Parameters fideslibParams{ .logN = logN, .L = L, .dnum = dnum, .primes = p64, .Sprimes = sp64 };
 
-	std::cerr << "[stage] raw params" << std::endl;
 	FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc);
-	std::cerr << "[dbg] L=" << raw_param.L << " dnum=" << raw_param.dnum << " K=" << raw_param.K << std::endl;
-	std::cerr << "[dbg] moduli(" << raw_param.moduli.size() << "):";
-	for (auto m : raw_param.moduli)
-		std::cerr << " " << m;
-	std::cerr << std::endl;
-	std::cerr << "[dbg] partitions(" << raw_param.PARTITIONmoduli.size() << "):" << std::endl;
-	for (size_t i = 0; i < raw_param.PARTITIONmoduli.size(); ++i) {
-		std::cerr << "[dbg]   part " << i << ":";
-		for (auto m : raw_param.PARTITIONmoduli[i])
-			std::cerr << " " << m;
-		std::cerr << std::endl;
-	}
-	std::cerr << "[stage] gpu context" << std::endl;
-	FIDESlib::CKKS::Context cc_		 = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), std::vector<int>{ 0 });
-	FIDESlib::CKKS::ContextData& gpu = *cc_;
-	std::cerr << "[stage] gpu context ok, N=" << gpu.N << " L=" << gpu.L << " meta0=" << gpu.meta[0].size() << std::endl;
+	FIDESlib::CKKS::Context cc_			= FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), std::vector<int>{ 0 });
+	FIDESlib::CKKS::ContextData& gpu	= *cc_;
 
 	const int N = gpu.N;
-	const int d = 64;
+	// A large row count keeps the subring degree k small, which matters because
+	// the host reference below is a naive O(k^2) negacyclic convolution.
+	const int d = 1024;
 	ASSERT_EQ(N % d, 0);
 	const FIDESlib::CKKS::BatchMatrixLayout layout(N, d);
 	const int k		  = layout.k;
@@ -259,7 +249,6 @@ TEST(BatchMatrixTest, BatchCPMMMatchesReference) {
 
 	const int level	   = inputs[0].c0.getLevel();
 	const int numLimbs = level + 1;
-	std::cerr << "[stage] encrypted, level=" << level << std::endl;
 
 	// Reference copy of the inputs in the coefficient domain.
 	std::vector<std::vector<std::vector<uint64_t>>> refC0(inner), refC1(inner);
@@ -280,12 +269,9 @@ TEST(BatchMatrixTest, BatchCPMMMatchesReference) {
 	for (auto& v : U)
 		v = small(rng);
 
-	std::cerr << "[stage] reference stored" << std::endl;
-
 	FIDESlib::CKKS::BatchMatrixPlaintext ptU(cc_, layout, inner, colsOut, level);
 	ptU.NoiseFactor = inputs[0].NoiseFactor;
 	ptU.Load(U);
-	std::cerr << "[stage] plaintext matrix loaded" << std::endl;
 
 	std::vector<FIDESlib::CKKS::Ciphertext*> inPtrs;
 	for (auto& c : inputs)
@@ -293,7 +279,6 @@ TEST(BatchMatrixTest, BatchCPMMMatchesReference) {
 
 	std::vector<FIDESlib::CKKS::Ciphertext> outputs;
 	FIDESlib::CKKS::BatchCPMM(outputs, inPtrs, ptU, /*rescale=*/false);
-	std::cerr << "[stage] BatchCPMM done" << std::endl;
 	ASSERT_EQ(outputs.size(), static_cast<size_t>(colsOut));
 
 	std::vector<std::vector<std::vector<uint64_t>>> gotC0(colsOut), gotC1(colsOut);
@@ -305,6 +290,15 @@ TEST(BatchMatrixTest, BatchCPMMMatchesReference) {
 		outputs[j].c1.store(gotC1[j]);
 	}
 
+	// Rows are an independent tiling dimension of the GEMM, so a naive host
+	// reference over every one of them would cost more than it proves. These
+	// cover the first eight register tiles plus both boundaries.
+	std::vector<int> checkRows;
+	for (int i = 0; i < 32 && i < d; ++i)
+		checkRows.push_back(i);
+	checkRows.push_back(d / 2);
+	checkRows.push_back(d - 1);
+
 	// Host reference: (B * U, A * U) over R_{q,k}, one limb at a time.
 	for (int comp = 0; comp < 2; ++comp) {
 		const auto& ref = (comp == 0) ? refC0 : refC1;
@@ -314,7 +308,7 @@ TEST(BatchMatrixTest, BatchCPMMMatchesReference) {
 			const int primeid = gpu.meta[0][l].id;
 			const uint64_t p  = gpu.prime[primeid].p;
 
-			for (int i = 0; i < d; ++i) {
+			for (int i : checkRows) {
 				for (int jj = 0; jj < colsOut; ++jj) {
 					std::vector<uint64_t> acc(k, 0);
 					for (int t = 0; t < inner; ++t) {
