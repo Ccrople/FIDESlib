@@ -192,6 +192,14 @@ int findDigitOnParam(const Parameters& param, uint64_t modulus) {
 				return i;
 		}
 	}
+	std::cerr << "[findDigitOnParam] MISS modulus=" << modulus << " primes=" << param.primes.size() << " L=" << param.L << " dnum=" << param.dnum
+			  << " partitions=" << param.raw->PARTITIONmoduli.size() << std::endl;
+	for (size_t i = 0; i < param.raw->PARTITIONmoduli.size(); ++i) {
+		std::cerr << "[findDigitOnParam]   part " << i << " (" << param.raw->PARTITIONmoduli.at(i).size() << "):";
+		for (uint64_t j : param.raw->PARTITIONmoduli.at(i))
+			std::cerr << " " << j;
+		std::cerr << std::endl;
+	}
 	return -1;
 }
 
