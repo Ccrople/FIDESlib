@@ -3,7 +3,9 @@
 //
 
 #include <errno.h>
+#ifdef NCCL
 #include <nccl.h>
+#endif
 
 #include <iomanip>
 
