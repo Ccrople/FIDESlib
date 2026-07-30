@@ -18,12 +18,16 @@ struct PrimeRecord {
 	int bits = -1;
 };
 
+/** @note @c stream is deliberately last. nvcc silently discards designated
+ *  initializers that follow a skipped member, and every call site skips
+ *  @c stream, so any field declared after it would keep its default instead of
+ *  the value written at the call site. */
 struct LimbRecord {
 	int id;
 	TYPE type;
-	Stream stream;
 	int digit		   = -1;
 	int destDeviceRank = -1;
+	Stream stream;
 	/*
 	LimbRecord(const int id, const TYPE type, cudaStream_t & stream)
 		: id(id), type(type), stream(stream) {

@@ -192,14 +192,6 @@ int findDigitOnParam(const Parameters& param, uint64_t modulus) {
 				return i;
 		}
 	}
-	std::cerr << "[findDigitOnParam] MISS modulus=" << modulus << " primes=" << param.primes.size() << " L=" << param.L << " dnum=" << param.dnum
-			  << " partitions=" << param.raw->PARTITIONmoduli.size() << std::endl;
-	for (size_t i = 0; i < param.raw->PARTITIONmoduli.size(); ++i) {
-		std::cerr << "[findDigitOnParam]   part " << i << " (" << param.raw->PARTITIONmoduli.at(i).size() << "):";
-		for (uint64_t j : param.raw->PARTITIONmoduli.at(i))
-			std::cerr << " " << j;
-		std::cerr << std::endl;
-	}
 	return -1;
 }
 
@@ -272,13 +264,6 @@ ContextData::generateMeta(const std::vector<int>& GPUid,
 
 std::vector<int> ContextData::computeLogQ_d(const int dnum, const std::vector<std::vector<LimbRecord>>& meta, const std::vector<PrimeRecord>& prime) {
 	std::vector<int> logQ_d(dnum, 0);
-
-	for (auto& i : meta)
-		for (auto& j : i)
-			if (j.digit < 0 || j.digit >= dnum || j.id < 0 || j.id >= (int)prime.size()) {
-				std::cerr << "[computeLogQ_d] BAD record id=" << j.id << " digit=" << j.digit << " dnum=" << dnum << " prime.size=" << prime.size()
-						  << " meta.size=" << meta.size() << " inner=" << i.size() << std::endl;
-			}
 
 	for (auto& i : meta)
 		for (auto& j : i)
