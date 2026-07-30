@@ -275,6 +275,13 @@ std::vector<int> ContextData::computeLogQ_d(const int dnum, const std::vector<st
 
 	for (auto& i : meta)
 		for (auto& j : i)
+			if (j.digit < 0 || j.digit >= dnum || j.id < 0 || j.id >= (int)prime.size()) {
+				std::cerr << "[computeLogQ_d] BAD record id=" << j.id << " digit=" << j.digit << " dnum=" << dnum << " prime.size=" << prime.size()
+						  << " meta.size=" << meta.size() << " inner=" << i.size() << std::endl;
+			}
+
+	for (auto& i : meta)
+		for (auto& j : i)
 			logQ_d.at(j.digit) += prime.at(j.id).bits;
 
 	return logQ_d;
