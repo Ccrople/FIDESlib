@@ -2,7 +2,9 @@
 // Created by carlosad on 25/3/26.
 //
 #include <errno.h>
+#ifdef NCCL
 #include <nccl.h>
+#endif
 
 #include <iomanip>
 

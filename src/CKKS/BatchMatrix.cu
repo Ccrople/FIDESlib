@@ -91,10 +91,6 @@ uint64_t centeredToModular(int64_t v, uint64_t p) {
 	return m == 0 ? 0 : p - m;
 }
 
-int64_t modularToCentered(uint64_t v, uint64_t p) {
-	return (v > p / 2) ? static_cast<int64_t>(v) - static_cast<int64_t>(p) : static_cast<int64_t>(v);
-}
-
 // ---------------------------------------------------------------------------
 // Twiddle tables for the length-k negacyclic transform
 // ---------------------------------------------------------------------------
