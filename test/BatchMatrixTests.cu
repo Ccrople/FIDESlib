@@ -238,7 +238,9 @@ TEST(BatchMatrixTest, BatchCPMMMatchesReference) {
 	std::vector<FIDESlib::CKKS::Ciphertext> inputs;
 	inputs.reserve(inner);
 	for (int j = 0; j < inner; ++j) {
-		std::vector<double> vals(gpu.N / 2);
+		// The encrypted values are irrelevant here; only the ciphertext
+		// polynomials matter, so a batch-sized vector is enough.
+		std::vector<double> vals(8);
 		for (auto& v : vals)
 			v = dist(rng);
 		lbcrypto::Plaintext pt = cc->MakeCKKSPackedPlaintext(vals);
