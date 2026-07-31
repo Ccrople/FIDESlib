@@ -122,6 +122,7 @@ uint64_t centeredToModular(int64_t v, uint64_t p) {
  */
 struct SubringTables {
 	int k		 = 0;
+	int d		 = 0;
 	int numLimbs = 0;
 	uint64_t* psi			 = nullptr; ///< [numLimbs][k] forward twiddles.
 	uint64_t* psi_shoup		 = nullptr;
@@ -130,6 +131,16 @@ struct SubringTables {
 	uint64_t* kinv			 = nullptr; ///< [numLimbs] k^-1 mod p.
 	uint64_t* kinv_shoup	 = nullptr;
 	int* primeids			 = nullptr; ///< [numLimbs]
+
+	// Tables for the partial transform between FIDESlib's length-N NTT domain
+	// and the R_k NTT domain. omega = psi_N^(2k) is a primitive d-th root, and
+	// each residue class of the length-N transform is a cyclic d-point DFT.
+	uint64_t* wfwd			= nullptr; ///< [numLimbs][d] omega^m.
+	uint64_t* wfwd_shoup	= nullptr;
+	uint64_t* winv			= nullptr; ///< [numLimbs][d] omega^-m.
+	uint64_t* winv_shoup	= nullptr;
+	uint64_t* psiFwd		= nullptr; ///< [numLimbs][k][d] psi_N^(+h0(s)*i).
+	uint64_t* psiInv		= nullptr; ///< [numLimbs][k][d] psi_N^(-h0(s)*i) / d.
 };
 
 std::mutex g_tablesMutex;
@@ -146,7 +157,7 @@ template <typename T> T* deviceCopy(const std::vector<T>& host) {
  * Tables depend only on the subring degree and the set of RNS primes, so they
  * are built once per configuration and shared by every batch matrix operation.
  */
-const SubringTables& getSubringTables(int k, const std::vector<int>& primeids, const std::vector<uint64_t>& primes, int device) {
+const SubringTables& getSubringTables(int k, const std::vector<int>& primeids, const std::vector<uint64_t>& primes, const std::vector<uint64_t>& psiN, int N, int device) {
 	// The key must carry the prime values, not just their ids: two contexts can
 	// use the same primeid slots for different primes (a different scaling
 	// modulus or ring degree is enough), and the twiddles are derived from the
@@ -162,14 +173,25 @@ const SubringTables& getSubringTables(int k, const std::vector<int>& primeids, c
 
 	const int numLimbs = static_cast<int>(primeids.size());
 	const int logk	   = log2i(k);
+	const int d		   = N / k;
 
 	std::vector<uint64_t> psi(static_cast<size_t>(numLimbs) * k), psi_s(static_cast<size_t>(numLimbs) * k);
 	std::vector<uint64_t> psi_i(static_cast<size_t>(numLimbs) * k), psi_i_s(static_cast<size_t>(numLimbs) * k);
 	std::vector<uint64_t> kinv(numLimbs), kinv_s(numLimbs);
+	std::vector<uint64_t> wf(static_cast<size_t>(numLimbs) * d), wf_s(static_cast<size_t>(numLimbs) * d);
+	std::vector<uint64_t> wi(static_cast<size_t>(numLimbs) * d), wi_s(static_cast<size_t>(numLimbs) * d);
+	std::vector<uint64_t> pf(static_cast<size_t>(numLimbs) * k * d), pi(static_cast<size_t>(numLimbs) * k * d);
 
 	for (int l = 0; l < numLimbs; ++l) {
-		const uint64_t p	 = primes[l];
-		const uint64_t root	 = find2kthRoot(p, k);
+		const uint64_t p = primes[l];
+
+		// The subring root must be the one FIDESlib's own transform induces:
+		// zeta = psi_N^d. Choosing an unrelated 2k-th root would still be a
+		// valid transform on its own, but it would not line up with the
+		// residue classes of the length-N NTT.
+		const uint64_t root	 = modpow(psiN[l], static_cast<uint64_t>(d), p);
+		if (modpow(root, k, p) != p - 1)
+			throw std::runtime_error("psi_N^d is not a primitive 2k-th root of unity");
 		const uint64_t iroot = modinv(root, p);
 		for (int i = 0; i < k; ++i) {
 			const uint32_t e			   = bitrev(static_cast<uint32_t>(i), logk);
@@ -180,10 +202,41 @@ const SubringTables& getSubringTables(int k, const std::vector<int>& primeids, c
 		}
 		kinv[l]	  = modinv(static_cast<uint64_t>(k) % p, p);
 		kinv_s[l] = shoupFactor(kinv[l], p);
+
+		// omega = psi_N^(2k), a primitive d-th root.
+		const uint64_t omega  = modpow(psiN[l], 2ull * k, p);
+		const uint64_t iomega = modinv(omega, p);
+		uint64_t accf = 1, acci = 1;
+		for (int m = 0; m < d; ++m) {
+			wf[static_cast<size_t>(l) * d + m]	 = accf;
+			wi[static_cast<size_t>(l) * d + m]	 = acci;
+			wf_s[static_cast<size_t>(l) * d + m] = shoupFactor(accf, p);
+			wi_s[static_cast<size_t>(l) * d + m] = shoupFactor(acci, p);
+			accf = static_cast<uint64_t>((static_cast<__uint128_t>(accf) * omega) % p);
+			acci = static_cast<uint64_t>((static_cast<__uint128_t>(acci) * iomega) % p);
+		}
+
+		// psi_N^(+-h0(s)*i), geometric in i so one modpow per slot suffices.
+		// The inverse table folds in the 1/d of the inverse DFT.
+		const uint64_t dinv = modinv(static_cast<uint64_t>(d) % p, p);
+		for (int s = 0; s < k; ++s) {
+			const uint64_t h0	= 2ull * bitrev(static_cast<uint32_t>(s), logk) + 1;
+			const uint64_t bf	= modpow(psiN[l], h0, p);
+			const uint64_t bi	= modinv(bf, p);
+			uint64_t cf = 1, ci = dinv;
+			for (int i = 0; i < d; ++i) {
+				const size_t off = (static_cast<size_t>(l) * k + s) * d + i;
+				pf[off]			 = cf;
+				pi[off]			 = ci;
+				cf = static_cast<uint64_t>((static_cast<__uint128_t>(cf) * bf) % p);
+				ci = static_cast<uint64_t>((static_cast<__uint128_t>(ci) * bi) % p);
+			}
+		}
 	}
 
 	SubringTables t;
 	t.k				 = k;
+	t.d				 = d;
 	t.numLimbs		 = numLimbs;
 	t.psi			 = deviceCopy(psi);
 	t.psi_shoup		 = deviceCopy(psi_s);
@@ -192,6 +245,12 @@ const SubringTables& getSubringTables(int k, const std::vector<int>& primeids, c
 	t.kinv			 = deviceCopy(kinv);
 	t.kinv_shoup	 = deviceCopy(kinv_s);
 	t.primeids		 = deviceCopy(primeids);
+	t.wfwd			 = deviceCopy(wf);
+	t.wfwd_shoup	 = deviceCopy(wf_s);
+	t.winv			 = deviceCopy(wi);
+	t.winv_shoup	 = deviceCopy(wi_s);
+	t.psiFwd		 = deviceCopy(pf);
+	t.psiInv		 = deviceCopy(pi);
 	CudaCheckErrorMod;
 
 	return g_tables.emplace(key, t).first->second;
@@ -359,6 +418,125 @@ __global__ void bm_intt_k(uint64_t* __restrict__ data,
 	const uint64_t kis = kinv_shoup[limb];
 	for (int i = threadIdx.x; i < k; i += blockDim.x)
 		g[i] = modmult<ALGO_SHOUP>(sh[i], ki, pid, kis);
+}
+
+/**
+ * FIDESlib's length-N NTT domain -> the R_k NTT domain, in one pass.
+ *
+ * Writing j = j_hi*d + j_lo, the length-N transform satisfies
+ *     out[j] = m(psi^(2*brv_N(j)+1)),   brv_N(j) = brv_k(j_hi) + k*brv_d(j_lo)
+ * so each j_hi is one residue class h0 = 2*brv_k(j_hi)+1 and, within it,
+ *     out[j] = sum_i [m_i(zeta^h0) * psi^(h0*i)] * omega^(t*i),  t = brv_d(j_lo).
+ * That is a plain cyclic d-point DFT, not a negacyclic one. Inverting just this
+ * stage lands directly in the R_k domain: the INTT_k that a full INTT_N would
+ * perform is exactly cancelled by the NTT_k that used to follow it.
+ *
+ * The class occupies d contiguous indices, so the load coalesces, and feeding
+ * natural j_lo order into a Cooley-Tukey butterfly consumes the bit-reversal
+ * for free.
+ */
+__global__ void bm_ntt_to_subring(uint64_t* __restrict__ dst,
+  const uint64_t* const* __restrict__ src,
+  const uint64_t* __restrict__ winv,
+  const uint64_t* __restrict__ winv_shoup,
+  const uint64_t* __restrict__ psiInv,
+  const int* __restrict__ primeids,
+  const int d,
+  const int cols,
+  const int k) {
+	extern __shared__ uint64_t sh[];
+
+	const int s	   = blockIdx.x;
+	const int col  = blockIdx.y;
+	const int limb = blockIdx.z;
+
+	const int pid	 = primeids[limb];
+	const uint64_t p = C_.primes[pid];
+
+	const uint64_t* __restrict__ in	 = src[static_cast<size_t>(limb) * cols + col] + static_cast<size_t>(s) * d;
+	const uint64_t* __restrict__ wt	 = winv + static_cast<size_t>(limb) * d;
+	const uint64_t* __restrict__ wts = winv_shoup + static_cast<size_t>(limb) * d;
+	const uint64_t* __restrict__ pt	 = psiInv + (static_cast<size_t>(limb) * k + s) * d;
+
+	for (int u = threadIdx.x; u < d; u += blockDim.x)
+		sh[u] = in[u];
+	__syncthreads();
+
+	// Cooley-Tukey: bit-reversed input, natural output.
+	for (int len = 2; len <= d; len <<= 1) {
+		const int half = len >> 1;
+		const int step = d / len;
+		for (int b = threadIdx.x; b < (d >> 1); b += blockDim.x) {
+			const int blk  = b / half;
+			const int j	   = b % half;
+			const int base = blk * len;
+			const uint64_t w = wt[step * j];
+			const uint64_t u = sh[base + j];
+			const uint64_t v = modmult<ALGO_SHOUP>(sh[base + j + half], w, pid, wts[step * j]);
+			uint64_t x = u + v;
+			x		   = (x >= p) ? x - p : x;
+			uint64_t y = u + p - v;
+			y		   = (y >= p) ? y - p : y;
+			sh[base + j]		= x;
+			sh[base + j + half] = y;
+		}
+		__syncthreads();
+	}
+
+	for (int i = threadIdx.x; i < d; i += blockDim.x)
+		dst[((static_cast<size_t>(limb) * d + i) * cols + col) * k + s] = modmult<ALGO_BARRETT>(sh[i], pt[i], pid);
+}
+
+/** Inverse of bm_ntt_to_subring. */
+__global__ void bm_subring_to_ntt(uint64_t* const* __restrict__ dst,
+  const uint64_t* __restrict__ src,
+  const uint64_t* __restrict__ wfwd,
+  const uint64_t* __restrict__ wfwd_shoup,
+  const uint64_t* __restrict__ psiFwd,
+  const int* __restrict__ primeids,
+  const int d,
+  const int cols,
+  const int k) {
+	extern __shared__ uint64_t sh[];
+
+	const int s	   = blockIdx.x;
+	const int col  = blockIdx.y;
+	const int limb = blockIdx.z;
+
+	const int pid	 = primeids[limb];
+	const uint64_t p = C_.primes[pid];
+
+	uint64_t* __restrict__ out		 = dst[static_cast<size_t>(limb) * cols + col] + static_cast<size_t>(s) * d;
+	const uint64_t* __restrict__ wt	 = wfwd + static_cast<size_t>(limb) * d;
+	const uint64_t* __restrict__ wts = wfwd_shoup + static_cast<size_t>(limb) * d;
+	const uint64_t* __restrict__ pt	 = psiFwd + (static_cast<size_t>(limb) * k + s) * d;
+
+	for (int i = threadIdx.x; i < d; i += blockDim.x)
+		sh[i] = modmult<ALGO_BARRETT>(src[((static_cast<size_t>(limb) * d + i) * cols + col) * k + s], pt[i], pid);
+	__syncthreads();
+
+	// Gentleman-Sande: natural input, bit-reversed output.
+	for (int len = d; len >= 2; len >>= 1) {
+		const int half = len >> 1;
+		const int step = d / len;
+		for (int b = threadIdx.x; b < (d >> 1); b += blockDim.x) {
+			const int blk  = b / half;
+			const int j	   = b % half;
+			const int base = blk * len;
+			const uint64_t u = sh[base + j];
+			const uint64_t v = sh[base + j + half];
+			uint64_t x = u + v;
+			x		   = (x >= p) ? x - p : x;
+			uint64_t y = u + p - v;
+			y		   = (y >= p) ? y - p : y;
+			sh[base + j]		= x;
+			sh[base + j + half] = modmult<ALGO_SHOUP>(y, wt[step * j], pid, wts[step * j]);
+		}
+		__syncthreads();
+	}
+
+	for (int u = threadIdx.x; u < d; u += blockDim.x)
+		out[u] = sh[u];
 }
 
 /** Shoup precomputation for the fixed plaintext operand of the GEMM. */
@@ -575,6 +753,32 @@ int limbPrimeId(const RNSPoly& poly, int limb) {
 	return std::get<FIDESlib::TYPE::U64>(l).primeid;
 }
 
+/** The 2N-th roots FIDESlib's own transform is built on, per limb. */
+std::vector<uint64_t> rootsOfUnity(const ContextData& cc, const std::vector<int>& primeids) {
+	if (!cc.param.raw.has_value())
+		throw std::runtime_error("batch matrix multiplication needs the OpenFHE roots of unity; this context has no RawParams");
+	std::vector<uint64_t> r(primeids.size());
+	for (size_t i = 0; i < primeids.size(); ++i)
+		r[i] = cc.param.raw->root_of_unity.at(primeids[i]);
+	return r;
+}
+
+/** Ciphertext components in the length-N NTT domain -> subring tensor. */
+void launchToSubring(uint64_t* dst, const uint64_t* const* src, const SubringTables& t, int d, int cols, int k, int numLimbs) {
+	const int threads = std::min(d / 2, 256);
+	const dim3 grid(static_cast<unsigned>(k), static_cast<unsigned>(cols), static_cast<unsigned>(numLimbs));
+	const size_t shmem = static_cast<size_t>(d) * sizeof(uint64_t);
+	bm_ntt_to_subring<<<grid, threads, shmem>>>(dst, src, t.winv, t.winv_shoup, t.psiInv, t.primeids, d, cols, k);
+}
+
+/** Subring tensor -> ciphertext components in the length-N NTT domain. */
+void launchFromSubring(uint64_t* const* dst, const uint64_t* src, const SubringTables& t, int d, int cols, int k, int numLimbs) {
+	const int threads = std::min(d / 2, 256);
+	const dim3 grid(static_cast<unsigned>(k), static_cast<unsigned>(cols), static_cast<unsigned>(numLimbs));
+	const size_t shmem = static_cast<size_t>(d) * sizeof(uint64_t);
+	bm_subring_to_ntt<<<grid, threads, shmem>>>(dst, src, t.wfwd, t.wfwd_shoup, t.psiFwd, t.primeids, d, cols, k);
+}
+
 void launchNTTk(uint64_t* data, const SubringTables& t, int k, int transformsPerLimb, int numLimbs, bool inverse) {
 	const int threads = std::min(k / 2, 256);
 	const dim3 grid(transformsPerLimb, numLimbs);
@@ -768,7 +972,7 @@ void BatchMatrixPlaintext::Load(const std::vector<int64_t>& coeffs) {
 	}
 	cudaMemcpy(dev_, host.data(), host.size() * sizeof(uint64_t), cudaMemcpyHostToDevice);
 
-	const SubringTables& t = getSubringTables(k, primeids_, primes, device_);
+	const SubringTables& t = getSubringTables(k, primeids_, primes, rootsOfUnity(data, primeids_), data.N, device_);
 	launchNTTk(dev_, t, k, static_cast<int>(perLimb / k), numLimbs, false);
 
 	const int threads = 256;
@@ -819,7 +1023,7 @@ void BatchCPMM(std::vector<Ciphertext>& out, const std::vector<Ciphertext*>& in,
 		primeids[l] = limbPrimeId(in[0]->c0, l);
 		primes[l]	= cc.prime[primeids[l]].p;
 	}
-	const SubringTables& tables = getSubringTables(k, primeids, primes, device);
+	const SubringTables& tables = getSubringTables(k, primeids, primes, rootsOfUnity(cc, primeids), cc.N, device);
 
 	// Outputs inherit shape and level from the inputs; their contents are fully
 	// overwritten by the scatter below.
@@ -863,14 +1067,8 @@ void BatchCPMM(std::vector<Ciphertext>& out, const std::vector<Ciphertext*>& in,
 	cudaMalloc(&devDst1, static_cast<size_t>(numLimbs) * colsOut * sizeof(uint64_t*));
 	CudaCheckErrorMod;
 
-	// The subring view is defined on coefficients, so the inputs leave the NTT
-	// domain for the duration of the product and are restored afterwards.
-	for (Ciphertext* c : in) {
-		c->c0.INTT<ALGO_SHOUP>(1, false);
-		c->c1.INTT<ALGO_SHOUP>(1, false);
-	}
-	cudaDeviceSynchronize();
-
+	// The partial transform reads the inputs directly in the NTT domain, so they
+	// are never modified and need no round trip.
 	{
 		std::vector<const uint64_t*> h0(static_cast<size_t>(numLimbs) * inner), h1(static_cast<size_t>(numLimbs) * inner);
 		for (int l = 0; l < numLimbs; ++l)
@@ -891,15 +1089,8 @@ void BatchCPMM(std::vector<Ciphertext>& out, const std::vector<Ciphertext*>& in,
 		cudaMemcpy(devDst1, g1.data(), g1.size() * sizeof(uint64_t*), cudaMemcpyHostToDevice);
 	}
 
-	{
-		const dim3 block(BM_TILE, 8);
-		const dim3 grid((k + BM_TILE - 1) / BM_TILE, (d + BM_TILE - 1) / BM_TILE, static_cast<unsigned>(numLimbs) * inner);
-		bm_gather<<<grid, block>>>(A0, devSrc0, d, inner, k);
-		bm_gather<<<grid, block>>>(A1, devSrc1, d, inner, k);
-	}
-
-	launchNTTk(A0, tables, k, d * inner, numLimbs, false);
-	launchNTTk(A1, tables, k, d * inner, numLimbs, false);
+	launchToSubring(A0, devSrc0, tables, d, inner, k, numLimbs);
+	launchToSubring(A1, devSrc1, tables, d, inner, k, numLimbs);
 
 	{
 		const int threads = 32;
@@ -910,27 +1101,10 @@ void BatchCPMM(std::vector<Ciphertext>& out, const std::vector<Ciphertext*>& in,
 		bm_gemm<<<grid, threads>>>(C1, A1, U.data(), U.shoup(), tables.primeids, d, inner, colsOut, k);
 	}
 
-	launchNTTk(C0, tables, k, d * colsOut, numLimbs, true);
-	launchNTTk(C1, tables, k, d * colsOut, numLimbs, true);
-
-	{
-		const dim3 block(BM_TILE, 8);
-		const dim3 grid((k + BM_TILE - 1) / BM_TILE, (d + BM_TILE - 1) / BM_TILE, static_cast<unsigned>(numLimbs) * colsOut);
-		bm_scatter<<<grid, block>>>(devDst0, C0, d, colsOut, k);
-		bm_scatter<<<grid, block>>>(devDst1, C1, d, colsOut, k);
-	}
+	launchFromSubring(devDst0, C0, tables, d, colsOut, k, numLimbs);
+	launchFromSubring(devDst1, C1, tables, d, colsOut, k, numLimbs);
 	cudaDeviceSynchronize();
 	CudaCheckErrorMod;
-
-	for (Ciphertext* c : in) {
-		c->c0.NTT<ALGO_SHOUP>(1, false);
-		c->c1.NTT<ALGO_SHOUP>(1, false);
-	}
-	for (int j = 0; j < colsOut; ++j) {
-		out[j].c0.NTT<ALGO_SHOUP>(1, false);
-		out[j].c1.NTT<ALGO_SHOUP>(1, false);
-	}
-	cudaDeviceSynchronize();
 
 	cudaFree(A0);
 	cudaFree(A1);
@@ -986,20 +1160,14 @@ std::vector<uint64_t*> componentPointers(const std::vector<Ciphertext*>& cts, bo
 void gatherToTensor(const std::vector<Ciphertext*>& cts, bool useC1, uint64_t* tensor, const SubringTables& tables, int d, int k, int numLimbs) {
 	const int cols = static_cast<int>(cts.size());
 	DevicePointers ptrs(componentPointers(cts, useC1, numLimbs));
-	const dim3 block(BM_TILE, 8);
-	const dim3 grid((k + BM_TILE - 1) / BM_TILE, (d + BM_TILE - 1) / BM_TILE, static_cast<unsigned>(numLimbs) * cols);
-	bm_gather<<<grid, block>>>(tensor, const_cast<const uint64_t* const*>(ptrs.dev), d, cols, k);
-	launchNTTk(tensor, tables, k, d * cols, numLimbs, false);
+	launchToSubring(tensor, const_cast<const uint64_t* const*>(ptrs.dev), tables, d, cols, k, numLimbs);
 }
 
-/** Inverse of gatherToTensor; leaves the ciphertext component in the coefficient domain. */
+/** Inverse of gatherToTensor; leaves the ciphertext component in the NTT domain. */
 void scatterFromTensor(uint64_t* tensor, const std::vector<Ciphertext*>& cts, bool useC1, const SubringTables& tables, int d, int k, int numLimbs) {
 	const int cols = static_cast<int>(cts.size());
-	launchNTTk(tensor, tables, k, d * cols, numLimbs, true);
 	DevicePointers ptrs(componentPointers(cts, useC1, numLimbs));
-	const dim3 block(BM_TILE, 8);
-	const dim3 grid((k + BM_TILE - 1) / BM_TILE, (d + BM_TILE - 1) / BM_TILE, static_cast<unsigned>(numLimbs) * cols);
-	bm_scatter<<<grid, block>>>(ptrs.dev, tensor, d, cols, k);
+	launchFromSubring(ptrs.dev, tensor, tables, d, cols, k, numLimbs);
 }
 
 std::vector<Ciphertext*> rawPointers(std::vector<Ciphertext>& v) {
@@ -1230,7 +1398,7 @@ void batchCCMMImpl(std::vector<Ciphertext>& out,
 		primeids[l] = limbPrimeId(a[0]->c0, l);
 		primes[l]	= cc.prime[primeids[l]].p;
 	}
-	const SubringTables& tables = getSubringTables(k, primeids, primes, device);
+	const SubringTables& tables = getSubringTables(k, primeids, primes, rootsOfUnity(cc, primeids), cc.N, device);
 
 	// Step 1: right operand becomes a row-wise matrix encryption. The transpose
 	// is applied by the GEMM strides below rather than by moving data.
@@ -1257,12 +1425,9 @@ void batchCCMMImpl(std::vector<Ciphertext>& out,
 	std::vector<Ciphertext*> bcmtPtrs = rawPointers(bcmt);
 
 	if (ownsLeft) {
-		intttAll(a);
 		gatherToTensor(a, false, B, tables, d, k, numLimbs);
 		gatherToTensor(a, true, A, tables, d, k, numLimbs);
-		nttAll(a);
 	}
-	intttAll(bcmtPtrs);
 	gatherToTensor(bcmtPtrs, false, Bo, tables, d, k, numLimbs);
 	gatherToTensor(bcmtPtrs, true, Ao, tables, d, k, numLimbs);
 
@@ -1289,11 +1454,9 @@ void batchCCMMImpl(std::vector<Ciphertext>& out,
 			dst.back().copy(*a[0]);
 		}
 		std::vector<Ciphertext*> p = rawPointers(dst);
-		intttAll(p);
 		scatterFromTensor(c0src, p, false, tables, d, k, numLimbs);
 		scatterFromTensor(c1src, p, true, tables, d, k, numLimbs);
 		cudaDeviceSynchronize();
-		nttAll(p);
 		BatchCMT(dst, layout);
 
 		// Transpose the resulting matrices, a pure coefficient permutation.
@@ -1467,7 +1630,7 @@ void RectangularCCMM(std::vector<Ciphertext>& out, const std::vector<Ciphertext*
 		primeids[l] = limbPrimeId(in[0]->c0, l);
 		primes[l]	= cc.prime[primeids[l]].p;
 	}
-	const SubringTables& tables = getSubringTables(k, primeids, primes, device);
+	const SubringTables& tables = getSubringTables(k, primeids, primes, rootsOfUnity(cc, primeids), cc.N, device);
 
 	const size_t elems = static_cast<size_t>(numLimbs) * d * d * k;
 	uint64_t *B = nullptr, *A = nullptr;
@@ -1475,10 +1638,8 @@ void RectangularCCMM(std::vector<Ciphertext>& out, const std::vector<Ciphertext*
 	cudaMalloc(&A, elems * sizeof(uint64_t));
 	CudaCheckErrorMod;
 
-	intttAll(in);
 	gatherToTensor(in, false, B, tables, d, k, numLimbs);
 	gatherToTensor(in, true, A, tables, d, k, numLimbs);
-	nttAll(in);
 
 	out.clear();
 	out.reserve(half);
