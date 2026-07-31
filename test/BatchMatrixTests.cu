@@ -39,6 +39,26 @@ void NegacyclicMulAcc(std::vector<uint64_t>& acc, const std::vector<uint64_t>& a
 	}
 }
 
+uint64_t ModPow(uint64_t base, uint64_t exp, uint64_t p) {
+	uint64_t r = 1, x = base % p;
+	while (exp) {
+		if (exp & 1)
+			r = static_cast<uint64_t>((static_cast<__uint128_t>(r) * x) % p);
+		x = static_cast<uint64_t>((static_cast<__uint128_t>(x) * x) % p);
+		exp >>= 1;
+	}
+	return r;
+}
+
+uint32_t BitRev(uint32_t x, int bits) {
+	uint32_t r = 0;
+	for (int i = 0; i < bits; ++i) {
+		r = (r << 1) | (x & 1u);
+		x >>= 1;
+	}
+	return r;
+}
+
 int64_t ToCentered(uint64_t v, uint64_t p) {
 	return (v > p / 2) ? static_cast<int64_t>(v) - static_cast<int64_t>(p) : static_cast<int64_t>(v);
 }
@@ -552,6 +572,65 @@ FIDESlib::CKKS::Ciphertext MakeTrivial(FIDESlib::CKKS::Context& cc_,
 }
 
 } // namespace
+
+/**
+ * Pins down what FIDESlib's length-N NTT actually computes.
+ *
+ * The partial-transform optimisation rests on the claim that the transform is
+ * the textbook Cooley-Tukey negacyclic NTT with a bit-reversed twiddle table,
+ * so that output[j] = m(psi^(2*brv(j)+1)) with psi the 2N-th root OpenFHE
+ * supplies. Transforming m = X makes that directly checkable, since evaluating
+ * X at a point returns the point itself.
+ *
+ * If this ever fails, the index algebra behind the partial transform is invalid
+ * and must be re-derived rather than patched.
+ */
+TEST(BatchMatrixTest, NTTOrderingIsBitReversedNegacyclic) {
+	RectangularFixture fx;
+	fx.Build(/*logN=*/12, /*L=*/2, /*dnum=*/1);
+
+	FIDESlib::CKKS::Context cc_		 = fx.gpu_;
+	FIDESlib::CKKS::ContextData& gpu = *cc_;
+	const int N						 = gpu.N;
+	const int logN					 = gpu.logN;
+
+	ASSERT_TRUE(gpu.param.raw.has_value()) << "need OpenFHE roots to know psi";
+
+	std::vector<double> vals(8, 0.5);
+	lbcrypto::Plaintext pt			  = fx.cc->MakeCKKSPackedPlaintext(vals);
+	auto ct							  = fx.cc->Encrypt(fx.keys.publicKey, pt);
+	FIDESlib::CKKS::RawCipherText raw = FIDESlib::CKKS::GetRawCipherText(fx.cc, ct);
+	FIDESlib::CKKS::Ciphertext probe(cc_, raw);
+
+	const int numLimbs = probe.c0.getLevel() + 1;
+	std::vector<std::vector<uint64_t>> data(numLimbs, std::vector<uint64_t>(N, 0));
+	std::vector<uint64_t> moduli(numLimbs);
+	for (int l = 0; l < numLimbs; ++l) {
+		moduli[l]  = gpu.prime[gpu.meta[0][l].id].p;
+		data[l][1] = 1; // m(X) = X
+	}
+	probe.c0.load(data, moduli);
+	probe.c0.NTT<FIDESlib::ALGO_SHOUP>(1, true);
+	cudaDeviceSynchronize();
+
+	std::vector<std::vector<uint64_t>> got;
+	probe.c0.store(got);
+
+	for (int l = 0; l < numLimbs; ++l) {
+		const int primeid = gpu.meta[0][l].id;
+		const uint64_t p  = gpu.prime[primeid].p;
+		const uint64_t psi = gpu.param.raw->root_of_unity.at(primeid);
+
+		// psi must be a primitive 2N-th root: psi^N == -1.
+		ASSERT_EQ(ModPow(psi, N, p), p - 1) << "root_of_unity is not a 2N-th root for limb " << l;
+
+		for (int j = 0; j < N; ++j) {
+			const uint32_t r	  = BitRev(static_cast<uint32_t>(j), logN);
+			const uint64_t expect = ModPow(psi, 2ull * r + 1, p);
+			ASSERT_EQ(got[l][j], expect) << "NTT ordering differs at limb " << l << " index " << j;
+		}
+	}
+}
 
 /**
  * Rectangular CPMM against a directly computed W = M * U.
