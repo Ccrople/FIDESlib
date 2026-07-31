@@ -147,9 +147,13 @@ template <typename T> T* deviceCopy(const std::vector<T>& host) {
  * are built once per configuration and shared by every batch matrix operation.
  */
 const SubringTables& getSubringTables(int k, const std::vector<int>& primeids, const std::vector<uint64_t>& primes, int device) {
+	// The key must carry the prime values, not just their ids: two contexts can
+	// use the same primeid slots for different primes (a different scaling
+	// modulus or ring degree is enough), and the twiddles are derived from the
+	// values. Keying on ids alone would silently hand back the wrong tables.
 	std::string key = std::to_string(device) + ":" + std::to_string(k);
-	for (int id : primeids)
-		key += "," + std::to_string(id);
+	for (size_t i = 0; i < primeids.size(); ++i)
+		key += "," + std::to_string(primeids[i]) + "@" + std::to_string(primes[i]);
 
 	std::lock_guard<std::mutex> lock(g_tablesMutex);
 	auto it = g_tables.find(key);
@@ -825,6 +829,20 @@ void BatchCPMM(std::vector<Ciphertext>& out, const std::vector<Ciphertext*>& in,
 		out.emplace_back(cc_);
 		out.back().copy(*in[0]);
 	}
+
+	// Touch every limb we will need before allocating anything: limbData rejects
+	// 32-bit limbs by throwing, and the device buffers below are raw pointers
+	// that an exception would leak.
+	for (int l = 0; l < numLimbs; ++l)
+		for (int j = 0; j < inner; ++j) {
+			(void)limbData(in[j]->c0, l);
+			(void)limbData(in[j]->c1, l);
+		}
+	for (int l = 0; l < numLimbs; ++l)
+		for (int j = 0; j < colsOut; ++j) {
+			(void)limbData(out[j].c0, l);
+			(void)limbData(out[j].c1, l);
+		}
 
 	const size_t inElems  = static_cast<size_t>(numLimbs) * d * inner * k;
 	const size_t outElems = static_cast<size_t>(numLimbs) * d * colsOut * k;
