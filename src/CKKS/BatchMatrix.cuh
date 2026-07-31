@@ -237,6 +237,51 @@ void BatchCCMM(std::vector<Ciphertext>& out,
   bool rescale = true);
 
 /**
+ * @brief Rotation indices needed by the rectangular algorithms.
+ *
+ * These use two CMT stages: CMT_2^{N/2} for the summation of Theorem 3 and
+ * CMT_k^d for the final conversion, so the key set is the union of both. The
+ * first stage needs the whole rotation group, i.e. N/2 - 1 keys, which is what
+ * the paper's lightweight CMT exists to avoid; here they are ordinary keys, so
+ * this is only practical at small ring degrees.
+ */
+std::vector<int> GetRectangularRotationIndices(const BatchMatrixLayout& layout);
+
+/**
+ * @brief Rectangular CPMM, Algorithm 5.
+ *
+ * Multiplies a d x N/2 encrypted matrix by an N/2 x N/2 plaintext matrix.
+ * Both are partitioned into d x d blocks, the block products are computed by a
+ * single batch CPMM, and the k/2 batch slots are then summed by extracting
+ * constant terms (Theorem 3).
+ *
+ * Requires rotation keys for GetRectangularRotationIndices(layout).
+ *
+ * @param out    Receives @c layout.d ciphertexts.
+ * @param in     @c layout.d ciphertexts encoding the d x d blocks of M.
+ * @param U      Encoded plaintext matrix of shape d x N/2.
+ * @param layout Subring layout.
+ */
+void RectangularCPMM(std::vector<Ciphertext>& out, const std::vector<Ciphertext*>& in, const BatchMatrixPlaintext& U, const BatchMatrixLayout& layout);
+
+/**
+ * @brief Rectangular CCMM, Algorithm 6.
+ *
+ * As RectangularCPMM, but the right operand is encrypted. It is split into
+ * k/2 square d x d batch matrices, each multiplied by @p in with a batch CCMM,
+ * and the results are recombined before the same summation.
+ *
+ * Requires rotation keys for GetRectangularRotationIndices(layout) and the
+ * relinearisation key.
+ *
+ * @param out    Receives @c layout.d ciphertexts.
+ * @param in     @c layout.d ciphertexts encoding the d x d blocks of M.
+ * @param u      @c layout.N/2 ciphertexts encoding U.
+ * @param layout Subring layout.
+ */
+void RectangularCCMM(std::vector<Ciphertext>& out, const std::vector<Ciphertext*>& in, const std::vector<Ciphertext*>& u, const BatchMatrixLayout& layout);
+
+/**
  * @brief Build the R_N coefficient vectors of a matrix encryption's columns.
  *
  * Given the encoded matrix produced by BatchMatrixEncoder::Encode, returns the

@@ -3,6 +3,7 @@
 // "Fast Batch Matrix Multiplication in Ciphertexts".
 //
 
+#include "CKKS/ApproxModEval.cuh"
 #include "CKKS/BatchMatrix.cuh"
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/Context.cuh"
@@ -14,6 +15,7 @@
 #include "LimbUtils.cuh"
 #include "ModMult.cuh"
 
+#include <algorithm>
 #include <cmath>
 #include <map>
 #include <memory>
@@ -1315,6 +1317,91 @@ void BatchCCMM(std::vector<Ciphertext>& out,
 		if (rescale)
 			out[j].rescale();
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Rectangular matrix multiplication
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/**
+ * The summation of Theorem 3.
+ *
+ * After a batch product the k/2 slot-wise results still sit side by side; their
+ * sum appears as the constant term of each R_k entry. Reading the batch matrix
+ * with k = 2 instead of k turns those constant terms into the top d rows, so a
+ * CMT at that layout followed by a truncation extracts them, and a second CMT
+ * returns the result to the original column-wise layout.
+ *
+ * Consumes N/2 ciphertexts and leaves d.
+ */
+void summationWithEncodingConversion(std::vector<Ciphertext>& v, const BatchMatrixLayout& layout) {
+	const BatchMatrixLayout half(layout.N, layout.N / 2);
+	BatchCMT(v, half);
+	v.resize(layout.d);
+	BatchCMT(v, layout);
+}
+
+} // namespace
+
+std::vector<int> GetRectangularRotationIndices(const BatchMatrixLayout& layout) {
+	std::vector<int> res = GetBatchCMTRotationIndices(layout);
+	const BatchMatrixLayout half(layout.N, layout.N / 2);
+	const std::vector<int> other = GetBatchCMTRotationIndices(half);
+	res.insert(res.end(), other.begin(), other.end());
+	std::sort(res.begin(), res.end());
+	res.erase(std::unique(res.begin(), res.end()), res.end());
+	return res;
+}
+
+void RectangularCPMM(std::vector<Ciphertext>& out, const std::vector<Ciphertext*>& in, const BatchMatrixPlaintext& U, const BatchMatrixLayout& layout) {
+	CudaNvtxRange range("FIDESlib::CKKS::RectangularCPMM");
+
+	if (static_cast<int>(in.size()) != layout.d)
+		throw std::invalid_argument("RectangularCPMM expects exactly d ciphertexts");
+	if (U.rows() != layout.d || U.cols() != layout.N / 2)
+		throw std::invalid_argument("RectangularCPMM expects a d x N/2 plaintext matrix");
+
+	// Step 1: the block products, scaled so the constant terms carry the sum
+	// rather than the mean (Lemma 1 gives a factor of 2/k).
+	BatchCPMM(out, in, U, /*rescale=*/true);
+	for (Ciphertext& c : out)
+		multIntScalar(c, static_cast<uint64_t>(layout.k / 2));
+
+	// Steps 2 and 3
+	summationWithEncodingConversion(out, layout);
+}
+
+void RectangularCCMM(std::vector<Ciphertext>& out, const std::vector<Ciphertext*>& in, const std::vector<Ciphertext*>& u, const BatchMatrixLayout& layout) {
+	CudaNvtxRange range("FIDESlib::CKKS::RectangularCCMM");
+
+	const int d	   = layout.d;
+	const int half = layout.N / 2;
+	if (static_cast<int>(in.size()) != d)
+		throw std::invalid_argument("RectangularCCMM expects exactly d ciphertexts on the left");
+	if (static_cast<int>(u.size()) != half)
+		throw std::invalid_argument("RectangularCCMM expects N/2 ciphertexts on the right");
+	if (half % d != 0)
+		throw std::invalid_argument("N/2 must split into whole d-column blocks");
+
+	Context& cc_ = in[0]->cc_;
+	SetCurrentContext(cc_);
+
+	out.clear();
+	out.reserve(half);
+	for (int blk = 0; blk < half / d; ++blk) {
+		const std::vector<Ciphertext*> block(u.begin() + static_cast<size_t>(blk) * d, u.begin() + static_cast<size_t>(blk + 1) * d);
+		std::vector<Ciphertext> part;
+		BatchCCMM(part, in, block, layout, /*rescale=*/true);
+		for (Ciphertext& c : part) {
+			multIntScalar(c, static_cast<uint64_t>(layout.k / 2));
+			out.emplace_back(cc_);
+			out.back().copy(c);
+		}
+	}
+
+	summationWithEncodingConversion(out, layout);
 }
 
 } // namespace FIDESlib::CKKS
