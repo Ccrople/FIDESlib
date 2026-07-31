@@ -1187,11 +1187,24 @@ void BatchCMT(std::vector<Ciphertext>& ct, const BatchMatrixLayout& layout) {
 		ct[i].multMonomial(2 * N - i);
 }
 
-void BatchCCMM(std::vector<Ciphertext>& out,
+namespace {
+
+/**
+ * Body of batch CCMM.
+ *
+ * @param preB,preA When non-null, the left operand is already in the R_k NTT
+ *        domain and its gather is skipped. RectangularCCMM multiplies one left
+ *        operand against every block of the right one, so hoisting that gather
+ *        out of the loop removes k/2 - 1 redundant round trips through the
+ *        length-N transform.
+ */
+void batchCCMMImpl(std::vector<Ciphertext>& out,
   const std::vector<Ciphertext*>& a,
   const std::vector<Ciphertext*>& b,
   const BatchMatrixLayout& layout,
-  bool rescale) {
+  bool rescale,
+  uint64_t* preB,
+  uint64_t* preA) {
 	CudaNvtxRange range("FIDESlib::CKKS::BatchCCMM");
 
 	const int d = layout.d;
@@ -1229,22 +1242,29 @@ void BatchCCMM(std::vector<Ciphertext>& out,
 	}
 	BatchCMT(bcmt, layout);
 
-	const size_t elems = static_cast<size_t>(numLimbs) * d * d * k;
-	uint64_t *B = nullptr, *A = nullptr, *Bo = nullptr, *Ao = nullptr;
+	const size_t elems	 = static_cast<size_t>(numLimbs) * d * d * k;
+	const bool ownsLeft	 = (preB == nullptr);
+	uint64_t *B = preB, *A = preA, *Bo = nullptr, *Ao = nullptr;
 	uint64_t *C00 = nullptr, *C01 = nullptr, *C10 = nullptr, *C11 = nullptr;
-	for (uint64_t** p : { &B, &A, &Bo, &Ao, &C00, &C01, &C10, &C11 })
+	if (ownsLeft) {
+		cudaMalloc(&B, elems * sizeof(uint64_t));
+		cudaMalloc(&A, elems * sizeof(uint64_t));
+	}
+	for (uint64_t** p : { &Bo, &Ao, &C00, &C01, &C10, &C11 })
 		cudaMalloc(p, elems * sizeof(uint64_t));
 	CudaCheckErrorMod;
 
 	std::vector<Ciphertext*> bcmtPtrs = rawPointers(bcmt);
 
-	intttAll(a);
+	if (ownsLeft) {
+		intttAll(a);
+		gatherToTensor(a, false, B, tables, d, k, numLimbs);
+		gatherToTensor(a, true, A, tables, d, k, numLimbs);
+		nttAll(a);
+	}
 	intttAll(bcmtPtrs);
-	gatherToTensor(a, false, B, tables, d, k, numLimbs);
-	gatherToTensor(a, true, A, tables, d, k, numLimbs);
 	gatherToTensor(bcmtPtrs, false, Bo, tables, d, k, numLimbs);
 	gatherToTensor(bcmtPtrs, true, Ao, tables, d, k, numLimbs);
-	nttAll(a);
 
 	// Step 2. The right operands are consumed transposed: entry (t,j) of Bo^T
 	// is Bo[j][t], so the strides are swapped.
@@ -1305,7 +1325,11 @@ void BatchCCMM(std::vector<Ciphertext>& out,
 	toCiphertexts(C00, C01, D01);
 	toCiphertexts(C10, C11, D23);
 
-	for (uint64_t* p : { B, A, Bo, Ao, C00, C01, C10, C11 })
+	if (ownsLeft) {
+		cudaFree(B);
+		cudaFree(A);
+	}
+	for (uint64_t* p : { Bo, Ao, C00, C01, C10, C11 })
 		cudaFree(p);
 	CudaCheckErrorMod;
 
@@ -1342,6 +1366,16 @@ void BatchCCMM(std::vector<Ciphertext>& out,
 		if (rescale)
 			out[j].rescale();
 	}
+}
+
+} // namespace
+
+void BatchCCMM(std::vector<Ciphertext>& out,
+  const std::vector<Ciphertext*>& a,
+  const std::vector<Ciphertext*>& b,
+  const BatchMatrixLayout& layout,
+  bool rescale) {
+	batchCCMMImpl(out, a, b, layout, rescale, nullptr, nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -1413,21 +1447,55 @@ void RectangularCCMM(std::vector<Ciphertext>& out, const std::vector<Ciphertext*
 	if (half % d != 0)
 		throw std::invalid_argument("N/2 must split into whole d-column blocks");
 
-	Context& cc_ = in[0]->cc_;
+	Context& cc_	= in[0]->cc_;
+	ContextData& cc = in[0]->cc;
 	SetCurrentContext(cc_);
+	requireSingleDevice(cc);
+
+	// The left operand is the same for every block, so gather it once. Doing it
+	// inside the loop would repeat a full length-N transform round trip on all
+	// d ciphertexts for each of the k/2 blocks.
+	const int k			= layout.k;
+	const int level		= in[0]->c0.getLevel();
+	const int numLimbs	= level + 1;
+	const int device	= cc.GPUid[0];
+	cudaSetDevice(device);
+
+	std::vector<int> primeids(numLimbs);
+	std::vector<uint64_t> primes(numLimbs);
+	for (int l = 0; l < numLimbs; ++l) {
+		primeids[l] = limbPrimeId(in[0]->c0, l);
+		primes[l]	= cc.prime[primeids[l]].p;
+	}
+	const SubringTables& tables = getSubringTables(k, primeids, primes, device);
+
+	const size_t elems = static_cast<size_t>(numLimbs) * d * d * k;
+	uint64_t *B = nullptr, *A = nullptr;
+	cudaMalloc(&B, elems * sizeof(uint64_t));
+	cudaMalloc(&A, elems * sizeof(uint64_t));
+	CudaCheckErrorMod;
+
+	intttAll(in);
+	gatherToTensor(in, false, B, tables, d, k, numLimbs);
+	gatherToTensor(in, true, A, tables, d, k, numLimbs);
+	nttAll(in);
 
 	out.clear();
 	out.reserve(half);
 	for (int blk = 0; blk < half / d; ++blk) {
 		const std::vector<Ciphertext*> block(u.begin() + static_cast<size_t>(blk) * d, u.begin() + static_cast<size_t>(blk + 1) * d);
 		std::vector<Ciphertext> part;
-		BatchCCMM(part, in, block, layout, /*rescale=*/true);
+		batchCCMMImpl(part, in, block, layout, /*rescale=*/true, B, A);
 		for (Ciphertext& c : part) {
 			multIntScalar(c, static_cast<uint64_t>(layout.k / 2));
 			out.emplace_back(cc_);
 			out.back().copy(c);
 		}
 	}
+
+	cudaFree(B);
+	cudaFree(A);
+	CudaCheckErrorMod;
 
 	summationWithEncodingConversion(out, layout);
 }
