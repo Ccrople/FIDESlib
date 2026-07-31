@@ -677,4 +677,118 @@ TEST(BatchMatrixTest, RectangularCPMMMatchesReference) {
 	}
 }
 
+/**
+ * Rectangular CCMM against the same directly computed W = M * U.
+ *
+ * Identical setup to the CPMM case except that U is encrypted, so the k/2
+ * blocks go through batch CCMM rather than batch CPMM. Both operands are
+ * trivially encrypted (c1 = 0), which keeps every key switch and the
+ * relinearisations noiseless.
+ */
+TEST(BatchMatrixTest, RectangularCCMMMatchesReference) {
+	RectangularFixture fx;
+	fx.Build(/*logN=*/12, /*L=*/4, /*dnum=*/1);
+
+	FIDESlib::CKKS::Context cc_		 = fx.gpu_;
+	FIDESlib::CKKS::ContextData& gpu = *cc_;
+	const int N						 = fx.N;
+	const int d						 = 64;
+	const FIDESlib::CKKS::BatchMatrixLayout layout(N, d);
+	const int k		= layout.k;
+	const int slots = layout.batch;
+	const int half	= N / 2;
+
+	FIDESlib::CKKS::GenAndAddRotationKeys(fx.cc, fx.keys, cc_, FIDESlib::CKKS::GetRectangularRotationIndices(layout));
+	{
+		FIDESlib::CKKS::KeySwitchingKey kskEval(cc_);
+		FIDESlib::CKKS::RawKeySwitchKey rawKskEval = FIDESlib::CKKS::GetEvalKeySwitchKey(fx.keys);
+		kskEval.Initialize(rawKskEval);
+		gpu.AddEvalKey(std::move(kskEval));
+	}
+
+	std::mt19937 rng(90210);
+	std::uniform_real_distribution<double> dist(-1.0, 1.0);
+
+	std::vector<std::vector<std::complex<double>>> Mb(slots, std::vector<std::complex<double>>(static_cast<size_t>(d) * d));
+	std::vector<std::vector<std::complex<double>>> Ub(slots, std::vector<std::complex<double>>(static_cast<size_t>(d) * half, { 0.0, 0.0 }));
+	for (int l = 0; l < slots; ++l)
+		for (int i = 0; i < d; ++i)
+			for (int j = 0; j < d; ++j) {
+				Mb[l][static_cast<size_t>(i) * d + j]	 = { dist(rng), 0.0 };
+				Ub[l][static_cast<size_t>(i) * half + j] = { dist(rng), 0.0 };
+			}
+
+	std::vector<double> W0(static_cast<size_t>(d) * d, 0.0);
+	for (int l = 0; l < slots; ++l)
+		for (int i = 0; i < d; ++i)
+			for (int j = 0; j < d; ++j) {
+				double acc = 0.0;
+				for (int t = 0; t < d; ++t)
+					acc += Mb[l][static_cast<size_t>(i) * d + t].real() * Ub[l][static_cast<size_t>(t) * half + j].real();
+				W0[static_cast<size_t>(i) * d + j] += acc;
+			}
+
+	FIDESlib::CKKS::BatchMatrixEncoder enc(k);
+	const double Delta = std::pow(2.0, 45);
+
+	std::vector<int64_t> Mcoeffs, Ucoeffs;
+	enc.Encode(Mb, d, d, Delta, Mcoeffs);
+	enc.Encode(Ub, d, half, Delta, Ucoeffs);
+
+	std::vector<std::vector<int64_t>> Mcolumns, Ucolumns;
+	FIDESlib::CKKS::BuildMatrixEncryptionCoefficients(Mcoeffs, layout, d, d, Mcolumns);
+	FIDESlib::CKKS::BuildMatrixEncryptionCoefficients(Ucoeffs, layout, d, half, Ucolumns);
+
+	std::vector<double> vals(8, 0.5);
+	lbcrypto::Plaintext pt			  = fx.cc->MakeCKKSPackedPlaintext(vals);
+	auto ctShape					  = fx.cc->Encrypt(fx.keys.publicKey, pt);
+	FIDESlib::CKKS::RawCipherText raw = FIDESlib::CKKS::GetRawCipherText(fx.cc, ctShape);
+	FIDESlib::CKKS::Ciphertext shape(cc_, raw);
+
+	std::vector<uint64_t> zeros(gpu.prime.size(), 0);
+	std::vector<FIDESlib::CKKS::Ciphertext> inputs, uinputs;
+	inputs.reserve(d);
+	for (int j = 0; j < d; ++j)
+		inputs.push_back(MakeTrivial(cc_, shape, Mcolumns[j], zeros));
+	uinputs.reserve(half);
+	for (int j = 0; j < half; ++j)
+		uinputs.push_back(MakeTrivial(cc_, shape, Ucolumns[j], zeros));
+
+	std::vector<FIDESlib::CKKS::Ciphertext*> in, u;
+	for (auto& c : inputs)
+		in.push_back(&c);
+	for (auto& c : uinputs)
+		u.push_back(&c);
+
+	std::vector<FIDESlib::CKKS::Ciphertext> out;
+	FIDESlib::CKKS::RectangularCCMM(out, in, u, layout);
+	ASSERT_EQ(out.size(), static_cast<size_t>(d));
+
+	const double scale = out[0].NoiseFactor;
+	const uint64_t p0  = gpu.prime[gpu.meta[0][0].id].p;
+
+	for (int j = 0; j < d; ++j) {
+		std::vector<std::vector<uint64_t>> c0, c1;
+		out[j].c0.INTT<FIDESlib::ALGO_SHOUP>(1, true);
+		out[j].c1.INTT<FIDESlib::ALGO_SHOUP>(1, true);
+		cudaDeviceSynchronize();
+		out[j].c0.store(c0);
+		out[j].c1.store(c1);
+
+		for (size_t i = 0; i < c1[0].size(); ++i)
+			ASSERT_EQ(c1[0][i], 0u) << "c1 leaked at column " << j << " coeff " << i;
+
+		for (int i = 0; i < d; ++i) {
+			const double got	  = static_cast<double>(ToCentered(c0[0][i], p0)) / scale;
+			const double expected = W0[static_cast<size_t>(i) * d + j];
+			ASSERT_NEAR(got, expected, 1e-2 * std::max(1.0, std::abs(expected))) << "W0 at (" << i << "," << j << ")";
+		}
+		for (int t = 1; t < slots; ++t)
+			for (int i = 0; i < d; ++i) {
+				const double got = static_cast<double>(ToCentered(c0[0][i + static_cast<size_t>(d) * t], p0)) / scale;
+				ASSERT_NEAR(got, 0.0, 1e-2) << "block " << t << " row " << i << " column " << j;
+			}
+	}
+}
+
 } // namespace FIDESlib::Testing
