@@ -1339,7 +1339,10 @@ namespace {
 void summationWithEncodingConversion(std::vector<Ciphertext>& v, const BatchMatrixLayout& layout) {
 	const BatchMatrixLayout half(layout.N, layout.N / 2);
 	BatchCMT(v, half);
-	v.resize(layout.d);
+	// Truncate to the top d rows. pop_back only destroys, whereas resize would
+	// instantiate the default-construct path and Ciphertext has no default ctor.
+	while (static_cast<int>(v.size()) > layout.d)
+		v.pop_back();
 	BatchCMT(v, layout);
 }
 
