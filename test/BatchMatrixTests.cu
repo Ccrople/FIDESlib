@@ -39,6 +39,10 @@ void NegacyclicMulAcc(std::vector<uint64_t>& acc, const std::vector<uint64_t>& a
 	}
 }
 
+int64_t ToCentered(uint64_t v, uint64_t p) {
+	return (v > p / 2) ? static_cast<int64_t>(v) - static_cast<int64_t>(p) : static_cast<int64_t>(v);
+}
+
 uint64_t ToModular(int64_t v, uint64_t p) {
 	if (v >= 0)
 		return static_cast<uint64_t>(v) % p;
@@ -472,6 +476,204 @@ TEST(BatchMatrixTest, BatchCCMMMatchesReference) {
 				ASSERT_EQ(gotC1[jj][l][i + static_cast<size_t>(d) * s], 0u) << "c1 should stay zero: limb " << l << " row " << i << " col " << jj;
 			}
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Rectangular matrix multiplication, Algorithms 5 and 6
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/** Shared setup for the rectangular tests. */
+struct RectangularFixture {
+	lbcrypto::CryptoContext<lbcrypto::DCRTPoly> cc;
+	lbcrypto::KeyPair<lbcrypto::DCRTPoly> keys;
+	FIDESlib::CKKS::Context gpu_;
+	int N = 0;
+
+	void Build(int logN, int L, int dnum) {
+		lbcrypto::CCParams<lbcrypto::CryptoContextCKKSRNS> parameters;
+		parameters.SetMultiplicativeDepth(L);
+		parameters.SetFirstModSize(55);
+		parameters.SetScalingModSize(45);
+		parameters.SetBatchSize(8);
+		parameters.SetSecurityLevel(lbcrypto::HEStd_NotSet);
+		parameters.SetRingDim(1 << logN);
+		parameters.SetNumLargeDigits(dnum);
+		parameters.SetScalingTechnique(lbcrypto::ScalingTechnique::FIXEDMANUAL);
+		parameters.SetSecretKeyDist(lbcrypto::UNIFORM_TERNARY);
+		parameters.SetPREMode(lbcrypto::INDCPA);
+
+		cc = GenCryptoContext(parameters);
+		cc->Enable(lbcrypto::PKE);
+		cc->Enable(lbcrypto::KEYSWITCH);
+		cc->Enable(lbcrypto::LEVELEDSHE);
+		keys = cc->KeyGen();
+		cc->EvalMultKeyGen(keys.secretKey);
+
+		FIDESlib::CKKS::Parameters fp{ .logN = logN, .L = L, .dnum = dnum, .primes = p64, .Sprimes = sp64 };
+		FIDESlib::CKKS::RawParams raw = FIDESlib::CKKS::GetRawParams(cc);
+		gpu_						  = FIDESlib::CKKS::GenCryptoContextGPU(fp.adaptTo(raw), std::vector<int>{ 0 });
+		N							  = gpu_->N;
+	}
+};
+
+/**
+ * Build a trivial encryption: c1 = 0 and c0 set to the given coefficients.
+ *
+ * With c1 = 0 the decryption phase is exactly c0, so the ciphertext carries the
+ * chosen polynomial exactly and every key switch downstream stays noiseless.
+ */
+FIDESlib::CKKS::Ciphertext MakeTrivial(FIDESlib::CKKS::Context& cc_,
+  const FIDESlib::CKKS::Ciphertext& shape,
+  const std::vector<int64_t>& coeffs,
+  const std::vector<uint64_t>& zeros) {
+	FIDESlib::CKKS::ContextData& gpu = *cc_;
+	FIDESlib::CKKS::Ciphertext ct(cc_);
+	ct.copy(shape);
+
+	const int numLimbs = ct.c0.getLevel() + 1;
+	std::vector<std::vector<uint64_t>> data(numLimbs, std::vector<uint64_t>(gpu.N, 0));
+	std::vector<uint64_t> moduli(numLimbs);
+	for (int l = 0; l < numLimbs; ++l) {
+		const uint64_t p = gpu.prime[gpu.meta[0][l].id].p;
+		moduli[l]		 = p;
+		for (int i = 0; i < gpu.N; ++i)
+			data[l][i] = ToModular(coeffs[i], p);
+	}
+	// load writes raw coefficients; the NTT then moves them to the evaluation
+	// domain the rest of the library expects.
+	ct.c0.load(data, moduli);
+	ct.c0.NTT<FIDESlib::ALGO_SHOUP>(1, true);
+	ct.c1.multScalar(const_cast<std::vector<uint64_t>&>(zeros));
+	cudaDeviceSynchronize();
+	return ct;
+}
+
+} // namespace
+
+/**
+ * Rectangular CPMM against a directly computed W = M * U.
+ *
+ * U is made nonzero only in its first d columns, which keeps the O(k^2) host
+ * encoder cheap and makes the expected answer a single d x d block: every
+ * later block of W must come out zero. The k/2 batch slots are all populated,
+ * so the summation of Theorem 3 is genuinely exercised.
+ *
+ * Note the output encoding: Theorem 3 yields M' = sum_j W_j Y^j, so block j of
+ * W lands in the Y^j coefficient of each R_k entry, not in a batch slot.
+ */
+TEST(BatchMatrixTest, RectangularCPMMMatchesReference) {
+	RectangularFixture fx;
+	fx.Build(/*logN=*/12, /*L=*/4, /*dnum=*/1);
+
+	FIDESlib::CKKS::Context cc_		 = fx.gpu_;
+	FIDESlib::CKKS::ContextData& gpu = *cc_;
+	const int N						 = fx.N;
+	const int d						 = 64;
+	const FIDESlib::CKKS::BatchMatrixLayout layout(N, d);
+	const int k		= layout.k;
+	const int slots = layout.batch;
+	const int half	= N / 2;
+
+	FIDESlib::CKKS::GenAndAddRotationKeys(fx.cc, fx.keys, cc_, FIDESlib::CKKS::GetRectangularRotationIndices(layout));
+
+	std::mt19937 rng(31337);
+	std::uniform_real_distribution<double> dist(-1.0, 1.0);
+
+	// M: slots blocks of d x d. U: slots blocks of d x half, nonzero only in
+	// the leading d columns.
+	std::vector<std::vector<std::complex<double>>> Mb(slots, std::vector<std::complex<double>>(static_cast<size_t>(d) * d));
+	std::vector<std::vector<std::complex<double>>> Ub(slots, std::vector<std::complex<double>>(static_cast<size_t>(d) * half, { 0.0, 0.0 }));
+	for (int l = 0; l < slots; ++l) {
+		for (int i = 0; i < d; ++i) {
+			for (int j = 0; j < d; ++j) {
+				Mb[l][static_cast<size_t>(i) * d + j] = { dist(rng), 0.0 };
+				Ub[l][static_cast<size_t>(i) * half + j] = { dist(rng), 0.0 };
+			}
+		}
+	}
+
+	// Expected leading block: W_0 = sum_l M_l * U_l[:, 0:d]
+	std::vector<double> W0(static_cast<size_t>(d) * d, 0.0);
+	for (int l = 0; l < slots; ++l)
+		for (int i = 0; i < d; ++i)
+			for (int j = 0; j < d; ++j) {
+				double acc = 0.0;
+				for (int t = 0; t < d; ++t)
+					acc += Mb[l][static_cast<size_t>(i) * d + t].real() * Ub[l][static_cast<size_t>(t) * half + j].real();
+				W0[static_cast<size_t>(i) * d + j] += acc;
+			}
+
+	FIDESlib::CKKS::BatchMatrixEncoder enc(k);
+	const double Delta = std::pow(2.0, 45);
+
+	std::vector<int64_t> Mcoeffs, Ucoeffs;
+	enc.Encode(Mb, d, d, Delta, Mcoeffs);
+	enc.Encode(Ub, d, half, Delta, Ucoeffs);
+
+	std::vector<std::vector<int64_t>> Mcolumns;
+	FIDESlib::CKKS::BuildMatrixEncryptionCoefficients(Mcoeffs, layout, d, d, Mcolumns);
+
+	// A shape ciphertext to clone level and metadata from.
+	std::vector<double> vals(8, 0.5);
+	lbcrypto::Plaintext pt			  = fx.cc->MakeCKKSPackedPlaintext(vals);
+	auto ctShape					  = fx.cc->Encrypt(fx.keys.publicKey, pt);
+	FIDESlib::CKKS::RawCipherText raw = FIDESlib::CKKS::GetRawCipherText(fx.cc, ctShape);
+	FIDESlib::CKKS::Ciphertext shape(cc_, raw);
+
+	std::vector<uint64_t> zeros(gpu.prime.size(), 0);
+	std::vector<FIDESlib::CKKS::Ciphertext> inputs;
+	inputs.reserve(d);
+	for (int j = 0; j < d; ++j)
+		inputs.push_back(MakeTrivial(cc_, shape, Mcolumns[j], zeros));
+
+	const int level = inputs[0].c0.getLevel();
+	FIDESlib::CKKS::BatchMatrixPlaintext ptU(cc_, layout, d, half, level);
+	ptU.NoiseFactor = Delta;
+	ptU.Load(Ucoeffs);
+
+	std::vector<FIDESlib::CKKS::Ciphertext*> in;
+	for (auto& c : inputs)
+		in.push_back(&c);
+
+	std::vector<FIDESlib::CKKS::Ciphertext> out;
+	FIDESlib::CKKS::RectangularCPMM(out, in, ptU, layout);
+	ASSERT_EQ(out.size(), static_cast<size_t>(d));
+
+	// c1 must still be exactly zero: nothing in the pipeline may inject noise
+	// into a trivially encrypted operand.
+	for (int j = 0; j < d; ++j) {
+		std::vector<std::vector<uint64_t>> c1;
+		out[j].c1.INTT<FIDESlib::ALGO_SHOUP>(1, true);
+		cudaDeviceSynchronize();
+		out[j].c1.store(c1);
+		for (size_t i = 0; i < c1[0].size(); ++i)
+			ASSERT_EQ(c1[0][i], 0u) << "c1 leaked at column " << j << " coeff " << i;
+	}
+
+	const double scale = out[0].NoiseFactor;
+	const uint64_t p0  = gpu.prime[gpu.meta[0][0].id].p;
+
+	for (int j = 0; j < d; ++j) {
+		std::vector<std::vector<uint64_t>> c0;
+		out[j].c0.INTT<FIDESlib::ALGO_SHOUP>(1, true);
+		cudaDeviceSynchronize();
+		out[j].c0.store(c0);
+
+		for (int i = 0; i < d; ++i) {
+			const double got	  = static_cast<double>(ToCentered(c0[0][i], p0)) / scale;
+			const double expected = W0[static_cast<size_t>(i) * d + j];
+			ASSERT_NEAR(got, expected, 1e-2 * std::max(1.0, std::abs(expected))) << "W0 at (" << i << "," << j << ")";
+		}
+		// Blocks beyond the first must vanish, since U is zero outside its
+		// leading d columns.
+		for (int t = 1; t < slots; ++t)
+			for (int i = 0; i < d; ++i) {
+				const double got = static_cast<double>(ToCentered(c0[0][i + static_cast<size_t>(d) * t], p0)) / scale;
+				ASSERT_NEAR(got, 0.0, 1e-2) << "block " << t << " row " << i << " column " << j;
+			}
 	}
 }
 

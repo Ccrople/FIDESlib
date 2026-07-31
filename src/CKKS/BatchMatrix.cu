@@ -633,6 +633,13 @@ void BatchMatrixEncoder::Encode(const std::vector<std::vector<std::complex<doubl
 
 	for (size_t e = 0; e < entries; ++e) {
 		int64_t* dst = out.data() + e * k_;
+		// Entries that are zero across the whole batch encode to zero; skipping
+		// them keeps sparse operands cheap, since this transform is O(k^2).
+		bool nonzero = false;
+		for (int j = 0; j < nslots && !nonzero; ++j)
+			nonzero = batch[j][e] != std::complex<double>(0.0, 0.0);
+		if (!nonzero)
+			continue;
 		for (int t = 0; t < k_; ++t) {
 			double acc = 0.0;
 			for (int j = 0; j < nslots; ++j) {
