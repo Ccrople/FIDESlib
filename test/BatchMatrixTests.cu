@@ -1052,4 +1052,136 @@ TEST(BatchMatrixTest, GpuTimingCCMM) {
 			  << std::endl;
 }
 
+// ---------------------------------------------------------------------------
+// Single-call profiling targets
+// ---------------------------------------------------------------------------
+//
+// One invocation each, so an Nsight Systems capture contains exactly one
+// instance of the operation under its NVTX range. Everything before the call is
+// setup and should be ignored on the timeline.
+
+TEST(BatchMatrixProfile, OnePCMM) {
+	RectangularFixture fx;
+	fx.Build(/*logN=*/16, /*L=*/23, /*dnum=*/2);
+
+	FIDESlib::CKKS::Context cc_		 = fx.gpu_;
+	FIDESlib::CKKS::ContextData& gpu = *cc_;
+	const int d						 = 1024;
+	const FIDESlib::CKKS::BatchMatrixLayout layout(gpu.N, d);
+	const int k		= layout.k;
+	const int inner = 8, cols = 8;
+
+	std::mt19937 rng(11);
+	std::uniform_real_distribution<double> dist(-1.0, 1.0);
+	std::uniform_int_distribution<int64_t> small(-4, 4);
+
+	std::vector<FIDESlib::CKKS::Ciphertext> inputs;
+	inputs.reserve(inner);
+	for (int j = 0; j < inner; ++j) {
+		std::vector<double> vals(8);
+		for (auto& v : vals)
+			v = dist(rng);
+		lbcrypto::Plaintext pt			  = fx.cc->MakeCKKSPackedPlaintext(vals);
+		auto ct							  = fx.cc->Encrypt(fx.keys.publicKey, pt);
+		FIDESlib::CKKS::RawCipherText raw = FIDESlib::CKKS::GetRawCipherText(fx.cc, ct);
+		inputs.emplace_back(cc_, raw);
+	}
+	const int level = inputs[0].c0.getLevel();
+
+	std::vector<int64_t> U(static_cast<size_t>(inner) * cols * k);
+	for (auto& v : U)
+		v = small(rng);
+	FIDESlib::CKKS::BatchMatrixPlaintext ptU(cc_, layout, inner, cols, level);
+	ptU.NoiseFactor = inputs[0].NoiseFactor;
+	ptU.Load(U);
+
+	std::vector<FIDESlib::CKKS::Ciphertext*> in;
+	for (auto& c : inputs)
+		in.push_back(&c);
+
+	cudaDeviceSynchronize();
+	std::vector<FIDESlib::CKKS::Ciphertext> out;
+	FIDESlib::CKKS::BatchCPMM(out, in, ptU, /*rescale=*/false);
+	cudaDeviceSynchronize();
+	std::cout << "[profile] one BatchCPMM N=" << gpu.N << " d=" << d << " k=" << k << " inner=" << inner << " cols=" << cols << " limbs=" << level + 1 << std::endl;
+}
+
+namespace {
+
+/** Shared setup for the CCMM and CMT single-call profiles. */
+void BuildCCMMOperands(RectangularFixture& fx,
+  const FIDESlib::CKKS::BatchMatrixLayout& layout,
+  int testLevel,
+  std::vector<FIDESlib::CKKS::Ciphertext>& opA,
+  std::vector<FIDESlib::CKKS::Ciphertext>& opB) {
+	FIDESlib::CKKS::Context cc_		 = fx.gpu_;
+	FIDESlib::CKKS::ContextData& gpu = *cc_;
+
+	FIDESlib::CKKS::GenAndAddRotationKeys(fx.cc, fx.keys, cc_, FIDESlib::CKKS::GetBatchCMTRotationIndices(layout));
+	{
+		FIDESlib::CKKS::KeySwitchingKey kskEval(cc_);
+		FIDESlib::CKKS::RawKeySwitchKey rawKskEval = FIDESlib::CKKS::GetEvalKeySwitchKey(fx.keys);
+		kskEval.Initialize(rawKskEval);
+		gpu.AddEvalKey(std::move(kskEval));
+	}
+
+	std::mt19937 rng(22);
+	std::uniform_real_distribution<double> dist(-1.0, 1.0);
+	auto build = [&](std::vector<FIDESlib::CKKS::Ciphertext>& dst) {
+		dst.reserve(layout.d);
+		for (int j = 0; j < layout.d; ++j) {
+			std::vector<double> vals(8);
+			for (auto& v : vals)
+				v = dist(rng);
+			lbcrypto::Plaintext pt			  = fx.cc->MakeCKKSPackedPlaintext(vals);
+			auto ct							  = fx.cc->Encrypt(fx.keys.publicKey, pt);
+			FIDESlib::CKKS::RawCipherText raw = FIDESlib::CKKS::GetRawCipherText(fx.cc, ct);
+			dst.emplace_back(cc_, raw);
+			dst.back().dropToLevel(testLevel);
+		}
+	};
+	build(opA);
+	build(opB);
+}
+
+} // namespace
+
+TEST(BatchMatrixProfile, OneCCMM) {
+	RectangularFixture fx;
+	fx.Build(/*logN=*/16, /*L=*/23, /*dnum=*/2);
+	const FIDESlib::CKKS::BatchMatrixLayout layout(fx.N, /*d=*/64);
+	constexpr int testLevel = 3;
+
+	std::vector<FIDESlib::CKKS::Ciphertext> opA, opB;
+	BuildCCMMOperands(fx, layout, testLevel, opA, opB);
+
+	std::vector<FIDESlib::CKKS::Ciphertext*> pa, pb;
+	for (auto& c : opA)
+		pa.push_back(&c);
+	for (auto& c : opB)
+		pb.push_back(&c);
+
+	cudaDeviceSynchronize();
+	std::vector<FIDESlib::CKKS::Ciphertext> out;
+	FIDESlib::CKKS::BatchCCMM(out, pa, pb, layout, /*rescale=*/false);
+	cudaDeviceSynchronize();
+	std::cout << "[profile] one BatchCCMM N=" << fx.N << " d=" << layout.d << " k=" << layout.k << " limbs=" << testLevel + 1 << std::endl;
+}
+
+TEST(BatchMatrixProfile, OneCMT) {
+	RectangularFixture fx;
+	fx.Build(/*logN=*/16, /*L=*/23, /*dnum=*/2);
+	const FIDESlib::CKKS::BatchMatrixLayout layout(fx.N, /*d=*/64);
+	constexpr int testLevel = 3;
+
+	std::vector<FIDESlib::CKKS::Ciphertext> opA, opB;
+	BuildCCMMOperands(fx, layout, testLevel, opA, opB);
+
+	cudaDeviceSynchronize();
+	FIDESlib::CKKS::BatchCMT(opA, layout);
+	cudaDeviceSynchronize();
+	std::cout << "[profile] one BatchCMT N=" << fx.N << " d=" << layout.d << " k=" << layout.k << " limbs=" << testLevel + 1 << " (" << layout.d - 1
+			  << " key switches)" << std::endl;
+}
+
 } // namespace FIDESlib::Testing
