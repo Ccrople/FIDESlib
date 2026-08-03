@@ -1114,12 +1114,14 @@ void BuildCCMMOperands(RectangularFixture& fx,
   int testLevel,
   std::vector<FIDESlib::CKKS::Ciphertext>& opA,
   std::vector<FIDESlib::CKKS::Ciphertext>& opB) {
-	FIDESlib::CKKS::Context cc_		 = fx.gpu_;
-	FIDESlib::CKKS::ContextData& gpu = *cc_;
+	// Ciphertext holds Context by reference, so everything must bind to the
+	// fixture's handle. A local copy here would die on return and leave every
+	// ciphertext referencing freed storage.
+	FIDESlib::CKKS::ContextData& gpu = *fx.gpu_;
 
-	FIDESlib::CKKS::GenAndAddRotationKeys(fx.cc, fx.keys, cc_, FIDESlib::CKKS::GetBatchCMTRotationIndices(layout));
+	FIDESlib::CKKS::GenAndAddRotationKeys(fx.cc, fx.keys, fx.gpu_, FIDESlib::CKKS::GetBatchCMTRotationIndices(layout));
 	{
-		FIDESlib::CKKS::KeySwitchingKey kskEval(cc_);
+		FIDESlib::CKKS::KeySwitchingKey kskEval(fx.gpu_);
 		FIDESlib::CKKS::RawKeySwitchKey rawKskEval = FIDESlib::CKKS::GetEvalKeySwitchKey(fx.keys);
 		kskEval.Initialize(rawKskEval);
 		gpu.AddEvalKey(std::move(kskEval));
@@ -1136,7 +1138,7 @@ void BuildCCMMOperands(RectangularFixture& fx,
 			lbcrypto::Plaintext pt			  = fx.cc->MakeCKKSPackedPlaintext(vals);
 			auto ct							  = fx.cc->Encrypt(fx.keys.publicKey, pt);
 			FIDESlib::CKKS::RawCipherText raw = FIDESlib::CKKS::GetRawCipherText(fx.cc, ct);
-			dst.emplace_back(cc_, raw);
+			dst.emplace_back(fx.gpu_, raw);
 			dst.back().dropToLevel(testLevel);
 		}
 	};
