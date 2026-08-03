@@ -640,7 +640,9 @@ __global__ void bm_gemm(uint64_t* __restrict__ C,
  * Same structure as bm_gemm, but the right operand has no precomputed Shoup
  * factors (it changes every call), so products go through Barrett. Its two
  * strides let the caller consume it transposed without moving any data, which
- * is what the (.)^T in steps 1, 3 and 4 of Algorithm 4 asks for.
+ * covers both transposes Algorithm 4 asks for: the (.)^T on the right operand
+ * of step 2, and the one on the whole product in steps 3 and 4, which falls out
+ * of swapping the two operands because (X * Y^T)^T = Y * X^T.
  */
 __global__ void bm_gemm_barrett(uint64_t* __restrict__ C,
   const uint64_t* __restrict__ A,
@@ -710,25 +712,6 @@ __global__ void bm_gemm_barrett(uint64_t* __restrict__ C,
 			Cl[(static_cast<size_t>(i) * colsB + j) * k + s] = acc[a][b];
 		}
 	}
-}
-
-/**
- * Transpose a matrix held as d column ciphertexts, in the coefficient domain.
- *
- * Entry (i,j) of the matrix lives in coefficient i + d*t of column j, so the
- * transpose is a pure permutation of coefficients across ciphertexts and needs
- * no subring transform.
- */
-__global__ void bm_transpose_columns(uint64_t* const* __restrict__ dst, const uint64_t* const* __restrict__ src, const int d, const int k) {
-	const int t = blockIdx.x * blockDim.x + threadIdx.x;
-	if (t >= k)
-		return;
-	const int j	   = blockIdx.y;
-	const int limb = blockIdx.z;
-
-	uint64_t* __restrict__ o = dst[static_cast<size_t>(limb) * d + j];
-	for (int i = 0; i < d; ++i)
-		o[i + static_cast<size_t>(d) * t] = src[static_cast<size_t>(limb) * d + i][j + static_cast<size_t>(d) * t];
 }
 
 // ---------------------------------------------------------------------------
@@ -1182,22 +1165,6 @@ std::vector<Ciphertext*> rawPointers(std::vector<Ciphertext>& v) {
 	return r;
 }
 
-void intttAll(const std::vector<Ciphertext*>& cts) {
-	for (Ciphertext* c : cts) {
-		c->c0.INTT<ALGO_SHOUP>(1, false);
-		c->c1.INTT<ALGO_SHOUP>(1, false);
-	}
-	cudaDeviceSynchronize();
-}
-
-void nttAll(const std::vector<Ciphertext*>& cts) {
-	for (Ciphertext* c : cts) {
-		c->c0.NTT<ALGO_SHOUP>(1, false);
-		c->c1.NTT<ALGO_SHOUP>(1, false);
-	}
-	cudaDeviceSynchronize();
-}
-
 /**
  * Algorithm 2, on ciphertexts that the caller owns.
  *
@@ -1469,21 +1436,33 @@ void batchCCMMImpl(std::vector<Ciphertext>& out,
 	gatherToTensor(bcmtPtrs, false, Bo, tables, d, k, numLimbs);
 	gatherToTensor(bcmtPtrs, true, Ao, tables, d, k, numLimbs);
 
-	// Step 2. The right operands are consumed transposed: entry (t,j) of Bo^T
-	// is Bo[j][t], so the strides are swapped.
+	// Step 2, already transposed for steps 3 and 4.
+	//
+	// Step 2 proper is (C00,C01,C10,C11) = (B,B,A,A) * (Bo,Ao,Bo,Ao)^T, which
+	// leaves each half row-wise: C00 + C01 * Toep(sk)^T is the first half of the
+	// product. Steps 3 and 4 then want (Cxy)^T, because transposing that
+	// identity gives C00^T + Toep(sk) * C01^T, the column-wise form a CMT
+	// consumes. Since (X * Y^T)^T = Y * X^T, swapping the two operands produces
+	// the transpose directly: the left operand is now the one read with swapped
+	// strides, and nothing has to move afterwards.
+	//
+	// The transpose has to happen here and not after the CMT. It permutes
+	// coefficients between ciphertexts, which is exact on these raw tensors but
+	// invalid on a real ciphertext, where c1 * sk mixes coefficients across the
+	// very runs being moved. The two orders agree only when c1 = 0.
 	{
 		const int threads = 32;
 		const dim3 grid((k + threads - 1) / threads, static_cast<unsigned>(((d + BM_TI - 1) / BM_TI) * ((d + BM_TJ - 1) / BM_TJ)), static_cast<unsigned>(numLimbs));
-		bm_gemm_barrett<<<grid, threads>>>(C00, B, Bo, tables.primeids, d, d, d, k, 1, d);
-		bm_gemm_barrett<<<grid, threads>>>(C01, B, Ao, tables.primeids, d, d, d, k, 1, d);
-		bm_gemm_barrett<<<grid, threads>>>(C10, A, Bo, tables.primeids, d, d, d, k, 1, d);
-		bm_gemm_barrett<<<grid, threads>>>(C11, A, Ao, tables.primeids, d, d, d, k, 1, d);
+		bm_gemm_barrett<<<grid, threads>>>(C00, Bo, B, tables.primeids, d, d, d, k, 1, d);
+		bm_gemm_barrett<<<grid, threads>>>(C01, Ao, B, tables.primeids, d, d, d, k, 1, d);
+		bm_gemm_barrett<<<grid, threads>>>(C10, Bo, A, tables.primeids, d, d, d, k, 1, d);
+		bm_gemm_barrett<<<grid, threads>>>(C11, Ao, A, tables.primeids, d, d, d, k, 1, d);
 		cudaDeviceSynchronize();
 		CudaCheckErrorMod;
 	}
 
-	// Steps 3 and 4: fold each half back into ciphertexts, transpose it, and
-	// convert it from row-wise to column-wise with a CMT.
+	// Steps 3 and 4: fold each transposed half back into ciphertexts and convert
+	// it from row-wise to column-wise with a CMT.
 	auto toCiphertexts = [&](uint64_t* c0src, uint64_t* c1src, std::vector<Ciphertext>& dst) {
 		dst.clear();
 		dst.reserve(d);
@@ -1496,30 +1475,6 @@ void batchCCMMImpl(std::vector<Ciphertext>& out,
 		scatterFromTensor(c1src, p, true, tables, d, k, numLimbs);
 		cudaDeviceSynchronize();
 		BatchCMT(dst, layout);
-
-		// Transpose the resulting matrices, a pure coefficient permutation.
-		std::vector<Ciphertext> tr;
-		tr.reserve(d);
-		for (int j = 0; j < d; ++j) {
-			tr.emplace_back(cc_);
-			tr.back().copy(dst[j]);
-		}
-		std::vector<Ciphertext*> tp = rawPointers(tr);
-		std::vector<Ciphertext*> sp = rawPointers(dst);
-		intttAll(sp);
-		intttAll(tp);
-		{
-			const dim3 grid((k + 127) / 128, static_cast<unsigned>(d), static_cast<unsigned>(numLimbs));
-			for (int comp = 0; comp < 2; ++comp) {
-				DevicePointers s(componentPointers(sp, comp == 1, numLimbs));
-				DevicePointers t(componentPointers(tp, comp == 1, numLimbs));
-				bm_transpose_columns<<<grid, 128>>>(t.dev, const_cast<const uint64_t* const*>(s.dev), d, k);
-				cudaDeviceSynchronize();
-			}
-		}
-		nttAll(tp);
-		for (int j = 0; j < d; ++j)
-			dst[j].copy(tr[j]);
 	};
 
 	std::vector<Ciphertext> D01, D23;

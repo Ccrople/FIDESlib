@@ -89,6 +89,74 @@ std::vector<int64_t> NegacyclicMulInt(const std::vector<int64_t>& a, const std::
 	return r;
 }
 
+/**
+ * Build a trivial encryption: c1 = 0 and c0 set to the given coefficients.
+ *
+ * With c1 = 0 the decryption phase is exactly c0, so the ciphertext carries the
+ * chosen polynomial exactly and every key switch downstream stays noiseless.
+ */
+FIDESlib::CKKS::Ciphertext MakeTrivial(FIDESlib::CKKS::Context& cc_,
+  const FIDESlib::CKKS::Ciphertext& shape,
+  const std::vector<int64_t>& coeffs,
+  const std::vector<uint64_t>& zeros) {
+	FIDESlib::CKKS::ContextData& gpu = *cc_;
+	FIDESlib::CKKS::Ciphertext ct(cc_);
+	ct.copy(shape);
+
+	const int numLimbs = ct.c0.getLevel() + 1;
+	std::vector<std::vector<uint64_t>> data(numLimbs, std::vector<uint64_t>(gpu.N, 0));
+	std::vector<uint64_t> moduli(numLimbs);
+	for (int l = 0; l < numLimbs; ++l) {
+		const uint64_t p = gpu.prime[gpu.meta[0][l].id].p;
+		moduli[l]		 = p;
+		for (int i = 0; i < gpu.N; ++i)
+			data[l][i] = ToModular(coeffs[i], p);
+	}
+	// load writes raw coefficients; the NTT then moves them to the evaluation
+	// domain the rest of the library expects.
+	ct.c0.load(data, moduli);
+	ct.c0.NTT<FIDESlib::ALGO_SHOUP>(1, true);
+	ct.c1.multScalar(const_cast<std::vector<uint64_t>&>(zeros));
+	cudaDeviceSynchronize();
+	return ct;
+}
+
+/**
+ * The decryption phase c0 + sk * c1, as raw coefficients per limb.
+ *
+ * Both components live in the length-N evaluation domain, so multiplying by the
+ * secret key is pointwise and needs no host convolution; the INTT afterwards
+ * gives the coefficients of the underlying plaintext plus the ciphertext's
+ * noise. @p skNTT must be the secret key in that same domain and at the same
+ * level, which MakeTrivial produces from the key's integer coefficients.
+ */
+void DecryptPhase(FIDESlib::CKKS::Context& cc_,
+  const FIDESlib::CKKS::Ciphertext& ct,
+  const FIDESlib::CKKS::RNSPoly& skNTT,
+  std::vector<std::vector<uint64_t>>& out) {
+	FIDESlib::CKKS::Ciphertext tmp(cc_);
+	tmp.copy(ct);
+	tmp.c1.multElement(skNTT);
+	tmp.c0.add(tmp.c1);
+	tmp.c0.INTT<FIDESlib::ALGO_SHOUP>(1, true);
+	cudaDeviceSynchronize();
+	tmp.c0.store(out);
+}
+
+/** The secret key's integer coefficients, read off its first RNS tower. */
+std::vector<int64_t> SecretKeyCoefficients(const lbcrypto::KeyPair<lbcrypto::DCRTPoly>& keys, int N) {
+	lbcrypto::DCRTPoly s = keys.secretKey->GetPrivateElement();
+	s.SetFormat(COEFFICIENT);
+	// The key is one integer polynomial shared by every tower, so tower 0 gives
+	// its coefficients outright and no limb ordering has to be matched.
+	const auto& tower0 = s.GetElementAtIndex(0);
+	const uint64_t p   = tower0.GetModulus().ConvertToInt();
+	std::vector<int64_t> r(N);
+	for (int i = 0; i < N; ++i)
+		r[i] = ToCentered(tower0[i].ConvertToInt(), p);
+	return r;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -502,6 +570,204 @@ TEST(BatchMatrixTest, BatchCCMMMatchesReference) {
 	}
 }
 
+/**
+ * Batch CCMM against a right operand that is a real ciphertext, c1 included.
+ *
+ * BatchCCMMMatchesReference gives both operands c1 = 0, which makes the whole
+ * pipeline exact but also blinds it to the order of the transpose and the CMT
+ * in steps 3 and 4: at c1 = 0 both are the same permutation of c0's
+ * coefficients, so either order composes to the same answer. Only a non-zero c1
+ * separates them, because the transpose moves coefficients between ciphertexts
+ * while c1 * sk mixes coefficients across the very runs being moved.
+ *
+ * The left operand here stays trivial and carries a known small integer matrix
+ * U, so C10 and C11 vanish and the result is exactly U * M' for the right
+ * operand's matrix M'. What is left is the key switching inside the two CMTs,
+ * hence a tolerance rather than equality. That tolerance can afford to be loose:
+ * getting the order wrong does not degrade the answer but destroys it, because
+ * the decryption phase of a mis-typed pair is uniform modulo q.
+ */
+TEST(BatchMatrixTest, BatchCCMMWithEncryptedRightOperand) {
+	constexpr int logN = 13;
+	constexpr int L	   = 4;
+	constexpr int dnum = 2;
+
+	lbcrypto::CCParams<lbcrypto::CryptoContextCKKSRNS> parameters;
+	parameters.SetMultiplicativeDepth(L);
+	parameters.SetFirstModSize(60);
+	parameters.SetScalingModSize(50);
+	parameters.SetBatchSize(8);
+	parameters.SetSecurityLevel(lbcrypto::HEStd_NotSet);
+	parameters.SetRingDim(1 << logN);
+	parameters.SetNumLargeDigits(dnum);
+	parameters.SetScalingTechnique(lbcrypto::ScalingTechnique::FIXEDMANUAL);
+	parameters.SetSecretKeyDist(lbcrypto::UNIFORM_TERNARY);
+	parameters.SetPREMode(lbcrypto::INDCPA);
+
+	lbcrypto::CryptoContext<lbcrypto::DCRTPoly> cc = GenCryptoContext(parameters);
+	cc->Enable(lbcrypto::PKE);
+	cc->Enable(lbcrypto::KEYSWITCH);
+	cc->Enable(lbcrypto::LEVELEDSHE);
+	lbcrypto::KeyPair<lbcrypto::DCRTPoly> keys = cc->KeyGen();
+	cc->EvalMultKeyGen(keys.secretKey);
+
+	FIDESlib::CKKS::Parameters fideslibParams{ .logN = logN, .L = L, .dnum = dnum, .primes = p64, .Sprimes = sp64 };
+	FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc);
+	FIDESlib::CKKS::Context cc_			= FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), std::vector<int>{ 0 });
+	FIDESlib::CKKS::ContextData& gpu	= *cc_;
+
+	// k = N / d = 64 keeps the host convolution, which is O(k^2) per term,
+	// cheap enough to check several entries exactly.
+	const int d = 128;
+	const FIDESlib::CKKS::BatchMatrixLayout layout(gpu.N, d);
+	const int k = layout.k;
+
+	FIDESlib::CKKS::GenAndAddRotationKeys(cc, keys, cc_, FIDESlib::CKKS::GetBatchCMTRotationIndices(layout));
+	{
+		FIDESlib::CKKS::KeySwitchingKey kskEval(cc_);
+		FIDESlib::CKKS::RawKeySwitchKey rawKskEval = FIDESlib::CKKS::GetEvalKeySwitchKey(keys);
+		kskEval.Initialize(rawKskEval);
+		gpu.AddEvalKey(std::move(kskEval));
+	}
+
+	// Two limbs keep the CRT lift below at 128 bits, and the product needs no
+	// more than that: U is small and M' sits at the 2^50 scaling factor.
+	constexpr int testLevel = 1;
+	const int numLimbs		= testLevel + 1;
+
+	std::mt19937 rng(90210);
+	std::uniform_real_distribution<double> dist(-1.0, 1.0);
+	std::vector<uint64_t> zeros(gpu.prime.size(), 0);
+
+	// Right operand: ordinary encryptions, so every c1 is non-zero.
+	std::vector<FIDESlib::CKKS::Ciphertext> opB;
+	opB.reserve(d);
+	for (int j = 0; j < d; ++j) {
+		std::vector<double> vals(8);
+		for (auto& v : vals)
+			v = dist(rng);
+		lbcrypto::Plaintext pt			  = cc->MakeCKKSPackedPlaintext(vals);
+		auto ct							  = cc->Encrypt(keys.publicKey, pt);
+		FIDESlib::CKKS::RawCipherText raw = FIDESlib::CKKS::GetRawCipherText(cc, ct);
+		opB.emplace_back(cc_, raw);
+		opB.back().dropToLevel(testLevel);
+	}
+	cudaDeviceSynchronize();
+
+	// Left operand: trivial, holding a known small integer matrix. Column j of
+	// the matrix encryption is the ciphertext whose coefficient i + d*s is
+	// coefficient s of entry (i,j).
+	std::uniform_int_distribution<int64_t> small(-4, 4);
+	std::vector<int64_t> U(static_cast<size_t>(d) * d * k);
+	for (auto& v : U)
+		v = small(rng);
+	auto entryU = [&](int i, int j) { return U.data() + (static_cast<size_t>(i) * d + j) * k; };
+
+	std::vector<FIDESlib::CKKS::Ciphertext> opA;
+	opA.reserve(d);
+	for (int j = 0; j < d; ++j) {
+		std::vector<int64_t> coeffs(gpu.N, 0);
+		for (int i = 0; i < d; ++i)
+			for (int s = 0; s < k; ++s)
+				coeffs[i + static_cast<size_t>(d) * s] = entryU(i, j)[s];
+		opA.push_back(MakeTrivial(cc_, opB[0], coeffs, zeros));
+	}
+
+	FIDESlib::CKKS::Ciphertext skct = MakeTrivial(cc_, opB[0], SecretKeyCoefficients(keys, gpu.N), zeros);
+
+	std::vector<FIDESlib::CKKS::Ciphertext*> pa, pb;
+	for (auto& c : opA)
+		pa.push_back(&c);
+	for (auto& c : opB)
+		pb.push_back(&c);
+
+	std::vector<FIDESlib::CKKS::Ciphertext> outputs;
+	FIDESlib::CKKS::BatchCCMM(outputs, pa, pb, layout, /*rescale=*/false);
+	ASSERT_EQ(outputs.size(), static_cast<size_t>(d));
+
+	// Garner over the two live limbs, centred, so the small values the pipeline
+	// is supposed to produce come back as small signed integers.
+	const uint64_t p0		  = gpu.prime[gpu.meta[0][0].id].p;
+	const uint64_t p1		  = gpu.prime[gpu.meta[0][1].id].p;
+	const __int128 q		  = static_cast<__int128>(p0) * p1;
+	const uint64_t p0InvModP1 = ModPow(p0 % p1, p1 - 2, p1);
+	auto lift				  = [&](uint64_t r0, uint64_t r1) {
+		 const uint64_t diff = (r1 + p1 - r0 % p1) % p1;
+		 const uint64_t t	 = static_cast<uint64_t>((static_cast<__uint128_t>(diff) * p0InvModP1) % p1);
+		 const __int128 x	 = static_cast<__int128>(r0) + static_cast<__int128>(p0) * t;
+		 return (x > q / 2) ? x - q : x;
+	};
+	auto decrypt = [&](const FIDESlib::CKKS::Ciphertext& ct) {
+		std::vector<std::vector<uint64_t>> res;
+		DecryptPhase(cc_, ct, skct.c0, res);
+		std::vector<__int128> out(gpu.N);
+		for (int i = 0; i < gpu.N; ++i)
+			out[i] = lift(res[0][i], res[1][i]);
+		return out;
+	};
+
+	std::vector<std::pair<int, int>> checks = { { 0, 0 }, { 0, 1 }, { 1, 0 }, { 3, 5 }, { d / 2, d / 2 }, { d - 1, d - 1 }, { d - 1, 0 }, { 0, d - 1 } };
+
+	// Decrypting a column costs a length-N INTT, so do each one once.
+	std::vector<int> columns;
+	for (auto [i, j] : checks)
+		columns.push_back(j);
+	std::sort(columns.begin(), columns.end());
+	columns.erase(std::unique(columns.begin(), columns.end()), columns.end());
+
+	std::vector<std::vector<__int128>> rightCol(columns.size()), outCol(columns.size());
+	for (size_t c = 0; c < columns.size(); ++c) {
+		rightCol[c] = decrypt(opB[columns[c]]);
+		outCol[c]	= decrypt(outputs[columns[c]]);
+	}
+
+	double worstError = 0.0;
+	double worstRatio = 0.0;
+	for (auto [i, j] : checks) {
+		const size_t c					   = static_cast<size_t>(std::find(columns.begin(), columns.end(), j) - columns.begin());
+		const std::vector<__int128>& mprime = rightCol[c];
+		const std::vector<__int128>& got	= outCol[c];
+
+		// Entry (i,j) of U * M' over R_k, exactly, from the decrypted M'.
+		std::vector<__int128> expected(k, 0);
+		for (int t = 0; t < d; ++t) {
+			const int64_t* u = entryU(i, t);
+			for (int x = 0; x < k; ++x) {
+				if (u[x] == 0)
+					continue;
+				for (int y = 0; y < k; ++y) {
+					const __int128 v   = static_cast<__int128>(u[x]) * mprime[t + static_cast<size_t>(d) * y];
+					const int idx	   = x + y;
+					if (idx >= k)
+						expected[idx - k] -= v;
+					else
+						expected[idx] += v;
+				}
+			}
+		}
+
+		__int128 maxAbs = 0;
+		for (int s = 0; s < k; ++s)
+			maxAbs = std::max(maxAbs, expected[s] < 0 ? -expected[s] : expected[s]);
+
+		// Four bits of slack on the entry's own scale. The key switching noise
+		// sits far below that, and a wrong transpose order lands near q/2.
+		const double tolerance = std::max(static_cast<double>(maxAbs) / 16.0, 1024.0 * 1024.0 * 1024.0 * 1024.0);
+		ASSERT_LT(tolerance * 8.0, static_cast<double>(q) / 2.0) << "tolerance is too close to the modulus to prove anything";
+
+		for (int s = 0; s < k; ++s) {
+			const __int128 diff = got[i + static_cast<size_t>(d) * s] - expected[s];
+			const double error	= static_cast<double>(diff < 0 ? -diff : diff);
+			worstError			= std::max(worstError, error);
+			worstRatio			= std::max(worstRatio, error / std::max(1.0, static_cast<double>(maxAbs)));
+			ASSERT_LE(error, tolerance) << "row " << i << " col " << j << " coeff " << s << ": error " << error << " against tolerance " << tolerance
+										<< " and modulus " << static_cast<double>(q);
+		}
+	}
+	std::cout << "[ccmm] N=" << gpu.N << " d=" << d << " k=" << k << " limbs=" << numLimbs << " worst error " << worstError << " (" << worstRatio
+			  << " of the entry scale), modulus " << static_cast<double>(q) << std::endl;
+}
+
 // ---------------------------------------------------------------------------
 // Rectangular matrix multiplication, Algorithms 5 and 6
 // ---------------------------------------------------------------------------
@@ -541,38 +807,6 @@ struct RectangularFixture {
 		N							  = gpu_->N;
 	}
 };
-
-/**
- * Build a trivial encryption: c1 = 0 and c0 set to the given coefficients.
- *
- * With c1 = 0 the decryption phase is exactly c0, so the ciphertext carries the
- * chosen polynomial exactly and every key switch downstream stays noiseless.
- */
-FIDESlib::CKKS::Ciphertext MakeTrivial(FIDESlib::CKKS::Context& cc_,
-  const FIDESlib::CKKS::Ciphertext& shape,
-  const std::vector<int64_t>& coeffs,
-  const std::vector<uint64_t>& zeros) {
-	FIDESlib::CKKS::ContextData& gpu = *cc_;
-	FIDESlib::CKKS::Ciphertext ct(cc_);
-	ct.copy(shape);
-
-	const int numLimbs = ct.c0.getLevel() + 1;
-	std::vector<std::vector<uint64_t>> data(numLimbs, std::vector<uint64_t>(gpu.N, 0));
-	std::vector<uint64_t> moduli(numLimbs);
-	for (int l = 0; l < numLimbs; ++l) {
-		const uint64_t p = gpu.prime[gpu.meta[0][l].id].p;
-		moduli[l]		 = p;
-		for (int i = 0; i < gpu.N; ++i)
-			data[l][i] = ToModular(coeffs[i], p);
-	}
-	// load writes raw coefficients; the NTT then moves them to the evaluation
-	// domain the rest of the library expects.
-	ct.c0.load(data, moduli);
-	ct.c0.NTT<FIDESlib::ALGO_SHOUP>(1, true);
-	ct.c1.multScalar(const_cast<std::vector<uint64_t>&>(zeros));
-	cudaDeviceSynchronize();
-	return ct;
-}
 
 } // namespace
 
