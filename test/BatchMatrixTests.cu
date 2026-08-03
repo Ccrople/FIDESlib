@@ -959,8 +959,27 @@ TEST(BatchMatrixTest, GpuTiming) {
 		std::vector<FIDESlib::CKKS::Ciphertext> out;
 		const double ms = TimeGpu([&] { FIDESlib::CKKS::BatchCPMM(out, in, ptU, /*rescale=*/false); }, 2, 9);
 
+		// The old path additionally moved every operand through the length-N
+		// transform: INTT on both components of each input, an NTT to restore
+		// them, and an NTT on each output. That is 2*(2*inner + cols) length-N
+		// transforms per call, all of which the partial transform removes.
+		const double msLenN = TimeGpu(
+		  [&] {
+			  for (int j = 0; j < inner; ++j) {
+				  inputs[j].c0.INTT<FIDESlib::ALGO_SHOUP>(1, false);
+				  inputs[j].c1.INTT<FIDESlib::ALGO_SHOUP>(1, false);
+				  inputs[j].c0.NTT<FIDESlib::ALGO_SHOUP>(1, false);
+				  inputs[j].c1.NTT<FIDESlib::ALGO_SHOUP>(1, false);
+			  }
+			  for (int j = 0; j < cols; ++j) {
+				  out[j].c0.NTT<FIDESlib::ALGO_SHOUP>(1, false);
+				  out[j].c1.NTT<FIDESlib::ALGO_SHOUP>(1, false);
+			  }
+		  },
+		  2, 9);
+
 		std::cout << "[timing] BatchCPMM N=" << N << " d=" << d << " k=" << k << " inner=" << inner << " cols=" << cols << " limbs=" << level + 1 << " : " << ms
-				  << " ms" << std::endl;
+				  << " ms  (length-N transforms removed by the partial transform: " << msLenN << " ms)" << std::endl;
 	}
 }
 
