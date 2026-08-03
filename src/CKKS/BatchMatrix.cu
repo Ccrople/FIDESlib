@@ -1312,8 +1312,20 @@ void BatchCMT(std::vector<Ciphertext>& ct, const BatchMatrixLayout& layout) {
 	for (int i = 1; i < d; ++i)
 		ct[i].multMonomial(i);
 
+	// Move into a pointer working set once. Every stage below permutes or
+	// rewrites pointers, so the two TWEAKs and the automorphism permutation all
+	// run without copying ciphertexts; only entry and exit copy.
+	std::vector<std::unique_ptr<Ciphertext>> work;
+	work.reserve(d);
+	for (int i = 0; i < d; ++i) {
+		work.push_back(std::make_unique<Ciphertext>(cc_));
+		work.back()->copy(ct[i]);
+	}
+	auto scratch = std::make_unique<Ciphertext>(cc_);
+	scratch->copy(ct[0]);
+
 	// Step 2
-	BatchTweak(ct, layout, +1);
+	tweakRecursive(work, k, +1, N, cc_, scratch);
 
 	// Step 3: scale by d^-1, then permute and apply the automorphisms. The map
 	// t -> t* is a bijection, so scaling every ciphertext once is equivalent to
@@ -1326,8 +1338,8 @@ void BatchCMT(std::vector<Ciphertext>& ct, const BatchMatrixLayout& layout) {
 				dinv[i] = modinv(static_cast<uint64_t>(d) % p, p);
 		}
 		for (int i = 0; i < d; ++i) {
-			ct[i].c0.multScalar(dinv);
-			ct[i].c1.multScalar(dinv);
+			work[i]->c0.multScalar(dinv);
+			work[i]->c1.multScalar(dinv);
 		}
 	}
 
@@ -1341,34 +1353,40 @@ void BatchCMT(std::vector<Ciphertext>& ct, const BatchMatrixLayout& layout) {
 		}
 	}
 
-	std::vector<Ciphertext> aux;
-	aux.reserve(d);
+	// t -> t* is a bijection, so the permutation is a pure pointer shuffle and
+	// each automorphism then runs in place.
+	std::vector<std::unique_ptr<Ciphertext>> permuted(d);
+	std::vector<int> rotIndex(d, 0);
 	for (int t = 0; t < d; ++t) {
 		const uint64_t h	= (2ull * k * t + 1) % mod;
 		const uint64_t hinv = modinvGeneric(h, mod);
 		const int tstar		= static_cast<int>((hinv - 1) / (2ull * k));
 		if (tstar < 0 || tstar >= d)
 			throw std::runtime_error("inverse Galois element fell outside the CMT index range");
-
-		aux.emplace_back(cc_);
-		aux.back().copy(ct[tstar]);
 		auto it = galoisToIndex.find(h);
 		if (it == galoisToIndex.end())
 			throw std::runtime_error("automorphism X -> X^(2kt+1) is not a slot rotation for this layout");
-		if (it->second != 0) {
-			// rotate() folds the index through normalyzeIndex, which is the
-			// identity only at full slot count.
-			const int savedSlots = aux.back().slots;
-			aux.back().slots	 = N / 2;
-			aux.back().rotate(it->second);
-			aux.back().slots = savedSlots;
-		}
+		rotIndex[t] = it->second;
+		permuted[t] = std::move(work[tstar]);
 	}
-	for (int t = 0; t < d; ++t)
-		ct[t].copy(aux[t]);
+	work = std::move(permuted);
+
+	for (int t = 0; t < d; ++t) {
+		if (rotIndex[t] == 0)
+			continue;
+		// rotate() folds the index through normalyzeIndex, which is the
+		// identity only at full slot count.
+		const int savedSlots = work[t]->slots;
+		work[t]->slots		 = N / 2;
+		work[t]->rotate(rotIndex[t]);
+		work[t]->slots = savedSlots;
+	}
 
 	// Step 4
-	BatchTweak(ct, layout, -1);
+	tweakRecursive(work, k, -1, N, cc_, scratch);
+
+	for (int i = 0; i < d; ++i)
+		ct[i].copy(*work[i]);
 
 	// Step 5: ct'_i <- X^-i * ct'_i
 	for (int i = 1; i < d; ++i)
