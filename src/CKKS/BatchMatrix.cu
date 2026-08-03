@@ -1198,8 +1198,21 @@ void nttAll(const std::vector<Ciphertext*>& cts) {
 	cudaDeviceSynchronize();
 }
 
-/** Algorithm 2, on ciphertexts that the caller owns. */
-void tweakRecursive(std::vector<std::unique_ptr<Ciphertext>>& ct, int k, int sgn, int N, Context& cc_) {
+/**
+ * Algorithm 2, on ciphertexts that the caller owns.
+ *
+ * The butterfly is done in place against a single reusable scratch ciphertext.
+ * The obvious formulation, lo->add(e,o) and hi->sub(e,o), costs two copies per
+ * butterfly because Ciphertext's three-operand add and sub are implemented as
+ * copy-then-accumulate, and it constructs two ciphertexts each time. Writing
+ * e += o in place and keeping e - o in the scratch halves the copies and
+ * removes the per-butterfly allocation entirely; the result is placed by
+ * swapping the owning pointers rather than by copying.
+ *
+ * One scratch is enough for the whole recursion: the sub-calls finish before
+ * this frame's combine loop starts, and the loop itself is sequential.
+ */
+void tweakRecursive(std::vector<std::unique_ptr<Ciphertext>>& ct, int k, int sgn, int N, Context& cc_, std::unique_ptr<Ciphertext>& scratch) {
 	const int d = static_cast<int>(ct.size());
 	if (d <= 1)
 		return;
@@ -1212,8 +1225,8 @@ void tweakRecursive(std::vector<std::unique_ptr<Ciphertext>>& ct, int k, int sgn
 		odd.push_back(std::move(ct[2 * j + 1]));
 	}
 
-	tweakRecursive(even, 2 * k, sgn, N, cc_);
-	tweakRecursive(odd, 2 * k, sgn, N, cc_);
+	tweakRecursive(even, 2 * k, sgn, N, cc_, scratch);
+	tweakRecursive(odd, 2 * k, sgn, N, cc_, scratch);
 
 	const long long twoN = 2ll * N;
 	for (int j = 0; j < d / 2; ++j) {
@@ -1222,12 +1235,13 @@ void tweakRecursive(std::vector<std::unique_ptr<Ciphertext>>& ct, int k, int sgn
 		if (power != 0)
 			odd[j]->multMonomial(power);
 
-		auto lo = std::make_unique<Ciphertext>(cc_);
-		auto hi = std::make_unique<Ciphertext>(cc_);
-		lo->add(*even[j], *odd[j]);
-		hi->sub(*even[j], *odd[j]);
-		ct[j]			= std::move(lo);
-		ct[j + d / 2]	= std::move(hi);
+		scratch->copy(*even[j]); // the only copy in the butterfly
+		even[j]->add(*odd[j]);	 // even := e + o, in place
+		scratch->sub(*odd[j]);	 // scratch := e - o, in place
+		std::swap(odd[j], scratch);
+
+		ct[j]		  = std::move(even[j]);
+		ct[j + d / 2] = std::move(odd[j]);
 	}
 }
 
@@ -1273,7 +1287,9 @@ void BatchTweak(std::vector<Ciphertext>& ct, const BatchMatrixLayout& layout, in
 		work.back()->copy(ct[i]);
 	}
 
-	tweakRecursive(work, layout.k, sgn, layout.N, cc_);
+	auto scratch = std::make_unique<Ciphertext>(cc_);
+	scratch->copy(ct[0]); // give the scratch a valid level and shape
+	tweakRecursive(work, layout.k, sgn, layout.N, cc_, scratch);
 
 	for (int i = 0; i < layout.d; ++i)
 		ct[i].copy(*work[i]);
