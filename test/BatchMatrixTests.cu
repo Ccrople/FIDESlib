@@ -983,4 +983,74 @@ TEST(BatchMatrixTest, GpuTiming) {
 	}
 }
 
+/**
+ * Times batch CCMM, which is what exercises key switching: each of its three
+ * CMTs applies d automorphisms, and every automorphism is a key switch. Kept at
+ * a reduced level so the eight d x d x k tensors stay affordable.
+ */
+TEST(BatchMatrixTest, GpuTimingCCMM) {
+	RectangularFixture fx;
+	fx.Build(/*logN=*/16, /*L=*/23, /*dnum=*/2);
+
+	FIDESlib::CKKS::Context cc_		 = fx.gpu_;
+	FIDESlib::CKKS::ContextData& gpu = *cc_;
+	const int N						 = fx.N;
+	const int d						 = 64;
+	const FIDESlib::CKKS::BatchMatrixLayout layout(N, d);
+	const int k = layout.k;
+
+	FIDESlib::CKKS::GenAndAddRotationKeys(fx.cc, fx.keys, cc_, FIDESlib::CKKS::GetBatchCMTRotationIndices(layout));
+	{
+		FIDESlib::CKKS::KeySwitchingKey kskEval(cc_);
+		FIDESlib::CKKS::RawKeySwitchKey rawKskEval = FIDESlib::CKKS::GetEvalKeySwitchKey(fx.keys);
+		kskEval.Initialize(rawKskEval);
+		gpu.AddEvalKey(std::move(kskEval));
+	}
+
+	constexpr int testLevel = 3;
+	std::mt19937 rng(24601);
+	std::uniform_real_distribution<double> dist(-1.0, 1.0);
+
+	auto build = [&](std::vector<FIDESlib::CKKS::Ciphertext>& dst) {
+		dst.reserve(d);
+		for (int j = 0; j < d; ++j) {
+			std::vector<double> vals(8);
+			for (auto& v : vals)
+				v = dist(rng);
+			lbcrypto::Plaintext pt			  = fx.cc->MakeCKKSPackedPlaintext(vals);
+			auto ct							  = fx.cc->Encrypt(fx.keys.publicKey, pt);
+			FIDESlib::CKKS::RawCipherText raw = FIDESlib::CKKS::GetRawCipherText(fx.cc, ct);
+			dst.emplace_back(cc_, raw);
+			dst.back().dropToLevel(testLevel);
+		}
+	};
+
+	std::vector<FIDESlib::CKKS::Ciphertext> opA, opB;
+	build(opA);
+	build(opB);
+
+	std::vector<FIDESlib::CKKS::Ciphertext*> pa, pb;
+	for (auto& c : opA)
+		pa.push_back(&c);
+	for (auto& c : opB)
+		pb.push_back(&c);
+
+	std::vector<FIDESlib::CKKS::Ciphertext> out;
+	const double msCCMM = TimeGpu([&] { FIDESlib::CKKS::BatchCCMM(out, pa, pb, layout, /*rescale=*/false); }, 1, 5);
+
+	// A single CMT in isolation: d automorphisms, i.e. d key switches.
+	std::vector<FIDESlib::CKKS::Ciphertext> cmt;
+	cmt.reserve(d);
+	for (int j = 0; j < d; ++j) {
+		cmt.emplace_back(cc_);
+		cmt.back().copy(opA[j]);
+	}
+	const double msCMT = TimeGpu([&] { FIDESlib::CKKS::BatchCMT(cmt, layout); }, 1, 5);
+
+	std::cout << "[timing] BatchCCMM N=" << N << " d=" << d << " k=" << k << " limbs=" << testLevel + 1 << " : " << msCCMM << " ms" << std::endl;
+	std::cout << "[timing] BatchCMT  N=" << N << " d=" << d << " k=" << k << " limbs=" << testLevel + 1 << " : " << msCMT << " ms (" << d << " key switches)"
+			  << std::endl;
+	}
+}
+
 } // namespace FIDESlib::Testing
