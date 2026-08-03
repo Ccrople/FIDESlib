@@ -1050,7 +1050,6 @@ TEST(BatchMatrixTest, GpuTimingCCMM) {
 	std::cout << "[timing] BatchCCMM N=" << N << " d=" << d << " k=" << k << " limbs=" << testLevel + 1 << " : " << msCCMM << " ms" << std::endl;
 	std::cout << "[timing] BatchCMT  N=" << N << " d=" << d << " k=" << k << " limbs=" << testLevel + 1 << " : " << msCMT << " ms (" << d << " key switches)"
 			  << std::endl;
-	}
 }
 
 } // namespace FIDESlib::Testing
