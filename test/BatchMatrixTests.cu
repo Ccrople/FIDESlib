@@ -14,7 +14,10 @@
 #include "CKKS/openfhe-interface/RawCiphertext.cuh"
 #include "ParametrizedTest.cuh"
 
+#include <algorithm>
+#include <functional>
 #include <gtest/gtest.h>
+#include <iostream>
 #include <random>
 
 namespace FIDESlib::Testing {
@@ -867,6 +870,97 @@ TEST(BatchMatrixTest, RectangularCCMMMatchesReference) {
 				const double got = static_cast<double>(ToCentered(c0[0][i + static_cast<size_t>(d) * t], p0)) / scale;
 				ASSERT_NEAR(got, 0.0, 1e-2) << "block " << t << " row " << i << " column " << j;
 			}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GPU-only timing
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/** Median wall time of a GPU call, measured with CUDA events. */
+double TimeGpu(const std::function<void()>& fn, int warmup, int iters) {
+	for (int i = 0; i < warmup; ++i)
+		fn();
+	cudaDeviceSynchronize();
+
+	std::vector<float> ms;
+	ms.reserve(iters);
+	for (int i = 0; i < iters; ++i) {
+		cudaEvent_t a, b;
+		cudaEventCreate(&a);
+		cudaEventCreate(&b);
+		cudaEventRecord(a);
+		fn();
+		cudaEventRecord(b);
+		cudaEventSynchronize(b);
+		float t = 0.0f;
+		cudaEventElapsedTime(&t, a, b);
+		ms.push_back(t);
+		cudaEventDestroy(a);
+		cudaEventDestroy(b);
+	}
+	std::sort(ms.begin(), ms.end());
+	return ms[ms.size() / 2];
+}
+
+} // namespace
+
+/**
+ * Times the GPU calls with no host reference in the loop.
+ *
+ * The correctness tests are dominated by their O(k^2) host references, so their
+ * wall times say nothing about GPU cost. These numbers are the ones to compare
+ * against when changing the kernels.
+ */
+TEST(BatchMatrixTest, GpuTiming) {
+	RectangularFixture fx;
+	fx.Build(/*logN=*/16, /*L=*/23, /*dnum=*/2);
+
+	FIDESlib::CKKS::Context cc_		 = fx.gpu_;
+	FIDESlib::CKKS::ContextData& gpu = *cc_;
+	const int N						 = fx.N;
+
+	std::mt19937 rng(5150);
+	std::uniform_real_distribution<double> dist(-1.0, 1.0);
+	std::uniform_int_distribution<int64_t> small(-4, 4);
+
+	for (int d : { 256, 1024 }) {
+		const FIDESlib::CKKS::BatchMatrixLayout layout(N, d);
+		const int k		= layout.k;
+		const int inner = 8;
+		const int cols	= 8;
+
+		std::vector<FIDESlib::CKKS::Ciphertext> inputs;
+		inputs.reserve(inner);
+		for (int j = 0; j < inner; ++j) {
+			std::vector<double> vals(8);
+			for (auto& v : vals)
+				v = dist(rng);
+			lbcrypto::Plaintext pt			  = fx.cc->MakeCKKSPackedPlaintext(vals);
+			auto ct							  = fx.cc->Encrypt(fx.keys.publicKey, pt);
+			FIDESlib::CKKS::RawCipherText raw = FIDESlib::CKKS::GetRawCipherText(fx.cc, ct);
+			inputs.emplace_back(cc_, raw);
+		}
+		const int level = inputs[0].c0.getLevel();
+
+		std::vector<int64_t> U(static_cast<size_t>(inner) * cols * k);
+		for (auto& v : U)
+			v = small(rng);
+		FIDESlib::CKKS::BatchMatrixPlaintext ptU(cc_, layout, inner, cols, level);
+		ptU.NoiseFactor = inputs[0].NoiseFactor;
+		ptU.Load(U);
+
+		std::vector<FIDESlib::CKKS::Ciphertext*> in;
+		for (auto& c : inputs)
+			in.push_back(&c);
+
+		std::vector<FIDESlib::CKKS::Ciphertext> out;
+		const double ms = TimeGpu([&] { FIDESlib::CKKS::BatchCPMM(out, in, ptU, /*rescale=*/false); }, 2, 9);
+
+		std::cout << "[timing] BatchCPMM N=" << N << " d=" << d << " k=" << k << " inner=" << inner << " cols=" << cols << " limbs=" << level + 1 << " : " << ms
+				  << " ms" << std::endl;
 	}
 }
 
