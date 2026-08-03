@@ -1051,20 +1051,23 @@ void BatchCPMM(std::vector<Ciphertext>& out, const std::vector<Ciphertext*>& in,
 	const size_t inElems  = static_cast<size_t>(numLimbs) * d * inner * k;
 	const size_t outElems = static_cast<size_t>(numLimbs) * d * colsOut * k;
 
+	// Stream-ordered allocation goes through the memory pool ContextData already
+	// configures with an unlimited release threshold, so after the first call
+	// these large buffers come back from the pool instead of the driver.
 	uint64_t *A0 = nullptr, *A1 = nullptr, *C0 = nullptr, *C1 = nullptr;
-	cudaMalloc(&A0, inElems * sizeof(uint64_t));
-	cudaMalloc(&A1, inElems * sizeof(uint64_t));
-	cudaMalloc(&C0, outElems * sizeof(uint64_t));
-	cudaMalloc(&C1, outElems * sizeof(uint64_t));
+	cudaMallocAsync(&A0, inElems * sizeof(uint64_t), 0);
+	cudaMallocAsync(&A1, inElems * sizeof(uint64_t), 0);
+	cudaMallocAsync(&C0, outElems * sizeof(uint64_t), 0);
+	cudaMallocAsync(&C1, outElems * sizeof(uint64_t), 0);
 
 	const uint64_t** devSrc0 = nullptr;
 	const uint64_t** devSrc1 = nullptr;
 	uint64_t** devDst0		 = nullptr;
 	uint64_t** devDst1		 = nullptr;
-	cudaMalloc(&devSrc0, static_cast<size_t>(numLimbs) * inner * sizeof(uint64_t*));
-	cudaMalloc(&devSrc1, static_cast<size_t>(numLimbs) * inner * sizeof(uint64_t*));
-	cudaMalloc(&devDst0, static_cast<size_t>(numLimbs) * colsOut * sizeof(uint64_t*));
-	cudaMalloc(&devDst1, static_cast<size_t>(numLimbs) * colsOut * sizeof(uint64_t*));
+	cudaMallocAsync(&devSrc0, static_cast<size_t>(numLimbs) * inner * sizeof(uint64_t*), 0);
+	cudaMallocAsync(&devSrc1, static_cast<size_t>(numLimbs) * inner * sizeof(uint64_t*), 0);
+	cudaMallocAsync(&devDst0, static_cast<size_t>(numLimbs) * colsOut * sizeof(uint64_t*), 0);
+	cudaMallocAsync(&devDst1, static_cast<size_t>(numLimbs) * colsOut * sizeof(uint64_t*), 0);
 	CudaCheckErrorMod;
 
 	// The partial transform reads the inputs directly in the NTT domain, so they
@@ -1076,8 +1079,8 @@ void BatchCPMM(std::vector<Ciphertext>& out, const std::vector<Ciphertext*>& in,
 				h0[static_cast<size_t>(l) * inner + j] = limbData(in[j]->c0, l);
 				h1[static_cast<size_t>(l) * inner + j] = limbData(in[j]->c1, l);
 			}
-		cudaMemcpy(devSrc0, h0.data(), h0.size() * sizeof(uint64_t*), cudaMemcpyHostToDevice);
-		cudaMemcpy(devSrc1, h1.data(), h1.size() * sizeof(uint64_t*), cudaMemcpyHostToDevice);
+		cudaMemcpyAsync(devSrc0, h0.data(), h0.size() * sizeof(uint64_t*), cudaMemcpyHostToDevice, 0);
+		cudaMemcpyAsync(devSrc1, h1.data(), h1.size() * sizeof(uint64_t*), cudaMemcpyHostToDevice, 0);
 
 		std::vector<uint64_t*> g0(static_cast<size_t>(numLimbs) * colsOut), g1(static_cast<size_t>(numLimbs) * colsOut);
 		for (int l = 0; l < numLimbs; ++l)
@@ -1085,8 +1088,9 @@ void BatchCPMM(std::vector<Ciphertext>& out, const std::vector<Ciphertext*>& in,
 				g0[static_cast<size_t>(l) * colsOut + j] = limbData(out[j].c0, l);
 				g1[static_cast<size_t>(l) * colsOut + j] = limbData(out[j].c1, l);
 			}
-		cudaMemcpy(devDst0, g0.data(), g0.size() * sizeof(uint64_t*), cudaMemcpyHostToDevice);
-		cudaMemcpy(devDst1, g1.data(), g1.size() * sizeof(uint64_t*), cudaMemcpyHostToDevice);
+		cudaMemcpyAsync(devDst0, g0.data(), g0.size() * sizeof(uint64_t*), cudaMemcpyHostToDevice, 0);
+		cudaMemcpyAsync(devDst1, g1.data(), g1.size() * sizeof(uint64_t*), cudaMemcpyHostToDevice, 0);
+		cudaStreamSynchronize(0); // host staging buffers go out of scope below
 	}
 
 	launchToSubring(A0, devSrc0, tables, d, inner, k, numLimbs);
@@ -1106,14 +1110,14 @@ void BatchCPMM(std::vector<Ciphertext>& out, const std::vector<Ciphertext*>& in,
 	cudaDeviceSynchronize();
 	CudaCheckErrorMod;
 
-	cudaFree(A0);
-	cudaFree(A1);
-	cudaFree(C0);
-	cudaFree(C1);
-	cudaFree(devSrc0);
-	cudaFree(devSrc1);
-	cudaFree(devDst0);
-	cudaFree(devDst1);
+	cudaFreeAsync(A0, 0);
+	cudaFreeAsync(A1, 0);
+	cudaFreeAsync(C0, 0);
+	cudaFreeAsync(C1, 0);
+	cudaFreeAsync(devSrc0, 0);
+	cudaFreeAsync(devSrc1, 0);
+	cudaFreeAsync(devDst0, 0);
+	cudaFreeAsync(devDst1, 0);
 	CudaCheckErrorMod;
 
 	// Step 2 of Algorithm 1: the product carries the plaintext scaling factor,
@@ -1136,12 +1140,12 @@ namespace {
 struct DevicePointers {
 	uint64_t** dev = nullptr;
 	explicit DevicePointers(const std::vector<uint64_t*>& host) {
-		cudaMalloc(&dev, host.size() * sizeof(uint64_t*));
-		cudaMemcpy(dev, host.data(), host.size() * sizeof(uint64_t*), cudaMemcpyHostToDevice);
+		cudaMallocAsync(&dev, host.size() * sizeof(uint64_t*), 0);
+		cudaMemcpyAsync(dev, host.data(), host.size() * sizeof(uint64_t*), cudaMemcpyHostToDevice, 0);
 	}
 	~DevicePointers() {
 		if (dev)
-			cudaFree(dev);
+			cudaFreeAsync(dev, 0);
 	}
 	DevicePointers(const DevicePointers&)			 = delete;
 	DevicePointers& operator=(const DevicePointers&) = delete;
@@ -1415,11 +1419,11 @@ void batchCCMMImpl(std::vector<Ciphertext>& out,
 	uint64_t *B = preB, *A = preA, *Bo = nullptr, *Ao = nullptr;
 	uint64_t *C00 = nullptr, *C01 = nullptr, *C10 = nullptr, *C11 = nullptr;
 	if (ownsLeft) {
-		cudaMalloc(&B, elems * sizeof(uint64_t));
-		cudaMalloc(&A, elems * sizeof(uint64_t));
+		cudaMallocAsync(&B, elems * sizeof(uint64_t), 0);
+		cudaMallocAsync(&A, elems * sizeof(uint64_t), 0);
 	}
 	for (uint64_t** p : { &Bo, &Ao, &C00, &C01, &C10, &C11 })
-		cudaMalloc(p, elems * sizeof(uint64_t));
+		cudaMallocAsync(p, elems * sizeof(uint64_t), 0);
 	CudaCheckErrorMod;
 
 	std::vector<Ciphertext*> bcmtPtrs = rawPointers(bcmt);
@@ -1489,11 +1493,11 @@ void batchCCMMImpl(std::vector<Ciphertext>& out,
 	toCiphertexts(C10, C11, D23);
 
 	if (ownsLeft) {
-		cudaFree(B);
-		cudaFree(A);
+		cudaFreeAsync(B, 0);
+		cudaFreeAsync(A, 0);
 	}
 	for (uint64_t* p : { Bo, Ao, C00, C01, C10, C11 })
-		cudaFree(p);
+		cudaFreeAsync(p, 0);
 	CudaCheckErrorMod;
 
 	// Step 5: relinearise (0, D3).
@@ -1634,8 +1638,8 @@ void RectangularCCMM(std::vector<Ciphertext>& out, const std::vector<Ciphertext*
 
 	const size_t elems = static_cast<size_t>(numLimbs) * d * d * k;
 	uint64_t *B = nullptr, *A = nullptr;
-	cudaMalloc(&B, elems * sizeof(uint64_t));
-	cudaMalloc(&A, elems * sizeof(uint64_t));
+	cudaMallocAsync(&B, elems * sizeof(uint64_t), 0);
+	cudaMallocAsync(&A, elems * sizeof(uint64_t), 0);
 	CudaCheckErrorMod;
 
 	gatherToTensor(in, false, B, tables, d, k, numLimbs);
@@ -1654,8 +1658,8 @@ void RectangularCCMM(std::vector<Ciphertext>& out, const std::vector<Ciphertext*
 		}
 	}
 
-	cudaFree(B);
-	cudaFree(A);
+	cudaFreeAsync(B, 0);
+	cudaFreeAsync(A, 0);
 	CudaCheckErrorMod;
 
 	summationWithEncodingConversion(out, layout);
