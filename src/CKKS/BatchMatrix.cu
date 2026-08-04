@@ -1008,13 +1008,17 @@ void BatchCPMM(std::vector<Ciphertext>& out, const std::vector<Ciphertext*>& in,
 	}
 	const SubringTables& tables = getSubringTables(k, primeids, primes, rootsOfUnity(cc, primeids), cc.N, device);
 
-	// Outputs inherit shape and level from the inputs; their contents are fully
-	// overwritten by the scatter below.
+	// Outputs inherit shape and level from the inputs, but their contents are
+	// fully overwritten by the scatter below: launchFromSubring writes all d*k = N
+	// coefficients of every limb of every column. So allocate the limbs and take
+	// the metadata, and skip the coefficient copy that copy() would perform.
 	out.clear();
 	out.reserve(colsOut);
 	for (int j = 0; j < colsOut; ++j) {
 		out.emplace_back(cc_);
-		out.back().copy(*in[0]);
+		out.back().c0.grow(level);
+		out.back().c1.grow(level);
+		out.back().copyMetadata(*in[0]);
 	}
 
 	// Touch every limb we will need before allocating anything: limbData rejects
@@ -1464,11 +1468,15 @@ void batchCCMMImpl(std::vector<Ciphertext>& out,
 	// Steps 3 and 4: fold each transposed half back into ciphertexts and convert
 	// it from row-wise to column-wise with a CMT.
 	auto toCiphertexts = [&](uint64_t* c0src, uint64_t* c1src, std::vector<Ciphertext>& dst) {
+		// As in BatchCPMM: the two scatters below rewrite every coefficient of
+		// both components, so only the shape and the metadata are needed here.
 		dst.clear();
 		dst.reserve(d);
 		for (int j = 0; j < d; ++j) {
 			dst.emplace_back(cc_);
-			dst.back().copy(*a[0]);
+			dst.back().c0.grow(level);
+			dst.back().c1.grow(level);
+			dst.back().copyMetadata(*a[0]);
 		}
 		std::vector<Ciphertext*> p = rawPointers(dst);
 		scatterFromTensor(c0src, p, false, tables, d, k, numLimbs);
