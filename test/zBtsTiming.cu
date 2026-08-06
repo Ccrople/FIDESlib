@@ -408,6 +408,8 @@ INSTANTIATE_TEST_SUITE_P(LLMTests, BtsTimingTests, testing::Values(TTALL64BOOT))
 //   FIDESLIB_BPREC_SCALETECH    FIXEDAUTO | FLEXIBLEAUTO | ...  (default FIXEDAUTO)
 //   FIDESLIB_BPREC_SLOTS        slot count, 0 means N/2         (default 0)
 //   FIDESLIB_BPREC_CPU          also bootstrap on the CPU       (default 0)
+//   FIDESLIB_BPREC_ITERS        Meta-BTS iterations, CPU only   (default 1)
+//   FIDESLIB_BPREC_PRECHINT     first-pass precision hint, 0=auto (default 0)
 //
 // The multiplicative depth is not a free knob: it is derived from the level
 // budget with OpenFHE's own GetBootstrapDepth, so each row is the *minimal*
@@ -521,9 +523,17 @@ TEST(BootstrapPrecisionSweep, ScalingModulus) {
 
 	const std::vector<int> scaleMods = BPrecEnvIntList("FIDESLIB_BPREC_SCALEMODS", { 40, 44, 48, 52, 55, 59 });
 
+	// Meta-BTS: OpenFHE can chain numIterations bootstraps, each correcting the
+	// residual of the last, which buys precision the single-shot call cannot
+	// reach. It costs one extra level per extra iteration. FIDESlib's GPU
+	// Bootstrap takes no iteration count, so this is measured on the CPU path
+	// only, and it is the reason the CPU column is worth having.
+	const int iters		= std::max(1, BPrecEnvInt("FIDESLIB_BPREC_ITERS", 1));
+	const int precHint	= BPrecEnvInt("FIDESLIB_BPREC_PRECHINT", 0);
+
 	const std::vector<uint32_t> levelBudget{ static_cast<uint32_t>(lb0), static_cast<uint32_t>(lb1) };
 	const uint32_t bootDepth = lbcrypto::FHECKKSRNS::GetBootstrapDepth(levelBudget, lbcrypto::UNIFORM_TERNARY);
-	const int L				 = static_cast<int>(bootDepth) + levelsAfter;
+	const int L				 = static_cast<int>(bootDepth) + levelsAfter + (iters - 1);
 
 	std::cout << "[bprec] logN=" << logN << " levelBudget={" << lb0 << "," << lb1 << "}"
 			  << " bootstrapDepth=" << bootDepth << " levelsAfter=" << levelsAfter << " => L=" << L << " (limbs=" << L + 1 << ")"
@@ -631,7 +641,7 @@ TEST(BootstrapPrecisionSweep, ScalingModulus) {
 		if (alsoCPU) {
 			try {
 				auto c2		 = cc->Encrypt(keys.publicKey, ptxt);
-				auto cpuBoot = cc->EvalBootstrap(c2);
+				auto cpuBoot = cc->EvalBootstrap(c2, static_cast<uint32_t>(iters), static_cast<uint32_t>(precHint));
 				lbcrypto::Plaintext cpu_pt;
 				cc->Decrypt(keys.secretKey, cpuBoot, &cpu_pt);
 				cpu_pt->SetLength(numSlots);
@@ -649,7 +659,7 @@ TEST(BootstrapPrecisionSweep, ScalingModulus) {
 				  << " outLevel=" << gpuLevel << " gpuWorstErr=" << gpuWorst << " gpuBitsWorst=" << BPrecBits(gpuWorst)
 				  << " gpuBitsRms=" << BPrecBits(gpuRms);
 		if (alsoCPU)
-			std::cout << " cpuWorstErr=" << cpuWorst << " cpuBitsWorst=" << BPrecBits(cpuWorst) << " cpuBitsRms=" << BPrecBits(cpuRms);
+			std::cout << " cpuIters=" << iters << " cpuWorstErr=" << cpuWorst << " cpuBitsWorst=" << BPrecBits(cpuWorst) << " cpuBitsRms=" << BPrecBits(cpuRms);
 		std::cout << gpuNote << std::endl;
 
 		cc->ClearEvalAutomorphismKeys();
