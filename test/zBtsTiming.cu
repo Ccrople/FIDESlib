@@ -401,7 +401,7 @@ INSTANTIATE_TEST_SUITE_P(LLMTests, BtsTimingTests, testing::Values(TTALL64BOOT))
 //
 //   FIDESLIB_BPREC_LOGN         ring degree exponent            (default 12)
 //   FIDESLIB_BPREC_SCALEMODS    comma-separated Delta widths    (default 40..59)
-//   FIDESLIB_BPREC_DEG          firstMod - scaleMod             (default 5)
+//   FIDESLIB_BPREC_DEG          firstMod - scaleMod             (default 1)
 //   FIDESLIB_BPREC_LB0/_LB1     CoeffsToSlots/SlotsToCoeffs budget (default 3,3)
 //   FIDESLIB_BPREC_DNUM         key-switching digits            (default 3)
 //   FIDESLIB_BPREC_LEVELSAFTER  levels left after bootstrapping (default 1)
@@ -416,12 +416,18 @@ INSTANTIATE_TEST_SUITE_P(LLMTests, BtsTimingTests, testing::Values(TTALL64BOOT))
 // CoeffModulus::MaxBitCount -- it is the cheapest modulus that does the job at
 // that Delta, not an arbitrary one.
 //
-// deg = firstMod - scaleMod is held fixed across the sweep for two reasons: it
-// is the message range q0/Delta the bootstrap can accept, and OpenFHE forms
-// correction = correctionFactor - deg on an unsigned type, so a deg above the
-// correction factor wraps. FIDESlib carries that guard commented out in
-// src/CKKS/Bootstrap.cu, so the wrap is silent; the test prints the correction
-// factor next to deg to make the margin visible.
+// deg = firstMod - scaleMod is a precision knob, not just a bookkeeping one.
+// OpenFHE forms correction = correctionFactor - deg, where correctionFactor is
+// the empirically fitted optimum for the ring degree and slot count, so every
+// bit of deg spends a bit of that optimum. deg = 1 is what OpenFHE's own
+// bootstrapping examples use and is the default here. deg above the correction
+// factor wraps the unsigned subtraction outright; FIDESlib carries that guard
+// commented out in src/CKKS/Bootstrap.cu, so the wrap is silent, and the test
+// prints the correction factor next to deg to make the margin visible.
+//
+// q0 cannot exceed the 60-bit native word, so firstMod is clamped there and deg
+// shrinks accordingly at the wide end of the sweep; the row reports the deg it
+// actually used.
 //===----------------------------------------------------------------------===//
 
 namespace {
@@ -504,7 +510,7 @@ double BPrecBits(double err) {
 
 TEST(BootstrapPrecisionSweep, ScalingModulus) {
 	const int logN		  = BPrecEnvInt("FIDESLIB_BPREC_LOGN", 12);
-	const int deg		  = BPrecEnvInt("FIDESLIB_BPREC_DEG", 5);
+	const int degWanted	  = BPrecEnvInt("FIDESLIB_BPREC_DEG", 1);
 	const int lb0		  = BPrecEnvInt("FIDESLIB_BPREC_LB0", 3);
 	const int lb1		  = BPrecEnvInt("FIDESLIB_BPREC_LB1", 3);
 	const int dnum		  = BPrecEnvInt("FIDESLIB_BPREC_DNUM", 3);
@@ -521,10 +527,19 @@ TEST(BootstrapPrecisionSweep, ScalingModulus) {
 
 	std::cout << "[bprec] logN=" << logN << " levelBudget={" << lb0 << "," << lb1 << "}"
 			  << " bootstrapDepth=" << bootDepth << " levelsAfter=" << levelsAfter << " => L=" << L << " (limbs=" << L + 1 << ")"
-			  << " dnum=" << dnum << " deg=" << deg << std::endl;
+			  << " dnum=" << dnum << " deg=" << degWanted << std::endl;
+
+	// A native-word modulus cannot be wider than 60 bits, so a wide Delta eats
+	// into deg rather than pushing q0 past the word.
+	constexpr int kMaxModSize = 60;
 
 	for (int scaleMod : scaleMods) {
-		const int firstMod = scaleMod + deg;
+		const int firstMod = std::min(scaleMod + degWanted, kMaxModSize);
+		const int deg	   = firstMod - scaleMod;
+		if (deg < 0) {
+			std::cout << "[bprec] logN=" << logN << " scaleMod=" << scaleMod << " skipped: q0 would exceed " << kMaxModSize << " bits" << std::endl;
+			continue;
+		}
 
 		CKKS::DeregisterAllContexts();
 
@@ -569,6 +584,11 @@ TEST(BootstrapPrecisionSweep, ScalingModulus) {
 		cc->EvalBootstrapSetup(levelBudget, { 0, 0 }, numSlots, 0, true, false);
 		cc->EvalBootstrapKeyGen(keys.secretKey, numSlots);
 		FIDESlib::CKKS::AddBootstrapPrecomputation(cc, keys, numSlots, GPUcc_);
+
+		// Only meaningful once EvalBootstrapSetup has run: it is the setup that
+		// fits the correction factor to the ring degree and slot count. Reading
+		// it off the RawParams captured before setup yields garbage.
+		const uint32_t correctionFactor = cc->GetScheme()->m_FHE->GetCKKSBootCorrectionFactor();
 
 		// A full slot vector, so the reported worst case really is the worst
 		// case: precision is a per-slot property and the linear transforms mix
@@ -624,7 +644,7 @@ TEST(BootstrapPrecisionSweep, ScalingModulus) {
 		}
 
 		std::cout << "[bprec] logN=" << logN << " slots=" << numSlots << " scaleMod=" << scaleMod << " firstMod=" << firstMod << " deg=" << deg
-				  << " correctionFactor=" << raw_param.correctionFactor << " L=" << L << " limbs=" << raw_param.moduli.size()
+				  << " correctionFactor=" << correctionFactor << " L=" << L << " limbs=" << raw_param.moduli.size()
 				  << " Pprimes=" << raw_param.SPECIALmoduli.size() << " logQ=" << logQ << " logP=" << logP << " logQP=" << logQP
 				  << " outLevel=" << gpuLevel << " gpuWorstErr=" << gpuWorst << " gpuBitsWorst=" << BPrecBits(gpuWorst)
 				  << " gpuBitsRms=" << BPrecBits(gpuRms);
